@@ -1,0 +1,4 @@
+interface:
+  display_name: "参考项目调研路线图"
+  short_description: "精选高匹配参考项目，对照当前项目生成差距分析和落地路线图"
+  default_prompt: "筛选这些参考对象，选取最匹配的项目做对照调研，并输出差距分析和落地路线图。"

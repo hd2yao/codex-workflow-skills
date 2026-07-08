@@ -1,0 +1,4 @@
+interface:
+  display_name: "项目状态审计"
+  short_description: "按需基于本地项目证据审计真实进度、风险缺口和后续任务"
+  default_prompt: "在确实需要证据审计时，基于本地文件、提交、测试和报告检查当前项目状态，并输出进度、风险和下一步建议。"

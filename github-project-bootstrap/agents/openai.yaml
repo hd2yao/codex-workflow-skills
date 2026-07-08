@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub项目初始化"
+  short_description: "创建或复用本地项目并安全连接个人GitHub仓库完成推送"
+  default_prompt: "使用 github-project-bootstrap 创建或复用本地项目，并连接到新的 GitHub 仓库："

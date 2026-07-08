@@ -1,0 +1,27 @@
+# Skill 治理结论
+
+- Skill：`program-workspace-governance`
+- 结论：先作为仓库内候选 Skill 编写和测试；最终实现通过后，建议“写入全局短入口 + 更新 Obsidian 索引”，但不在本轮 spec 阶段安装到全局。
+- 理由：
+  - 该能力是跨项目默认行为，覆盖无项目 Codex 对话、Program 目录产物、Obsidian 回流和 Codex C 点，属于入口型工作流。
+  - 只靠 `obsidian-memory-workflow` 不够，因为它不覆盖 Program 文件系统治理和 Hook/CLI 的事实记录。
+  - 直接写入全局会增加所有任务负担，应等 Skill、Hook dry-run 和 CLI dry-run 验证后，只加 1-2 条入口规则。
+- 需要修改：
+  - 后续实现 `program-workspace-governance/SKILL.md`。
+  - 后续实现通过后，更新 `Codex Skills 搜索索引.md` 和 `Codex 变更日志.md`。
+  - 如用户确认全局启用，再在 `/Users/dysania/.codex/AGENTS.md` 增加短入口。
+- 不需要修改：
+  - 本轮不修改全局 `AGENTS.md`。
+  - 本轮不安装到 `/Users/dysania/.codex/skills`。
+  - 本轮不移动 `/Users/dysania/program` 下任何目录。
+- 触发词建议：
+  - `program 整理`
+  - `无项目对话产物`
+  - `生成文档放哪里`
+  - `新建实验/原型`
+  - `整理 Codex 产物`
+  - `Obsidian 回流`
+- 验证建议：
+  - 用合成 transcript 测试 Hook manifest。
+  - 用 `/Users/dysania/program` 做只读 CLI dry-run。
+  - 用一个 Codex 自身变更样例测试 C 点回流规则。

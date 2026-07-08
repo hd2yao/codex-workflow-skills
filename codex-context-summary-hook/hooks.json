@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/dysania/.codex/hooks/context-summary-card.py"
+          }
+        ]
+      }
+    ]
+  }
+}

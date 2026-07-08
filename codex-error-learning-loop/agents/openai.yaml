@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex 错误学习闭环"
+  short_description: "记录 Codex 纠错事件，并判断是否晋升为规则或 Skill"
+  default_prompt: "Use $codex-error-learning-loop to turn this correction into a reusable prevention note."
+
+policy:
+  allow_implicit_invocation: true

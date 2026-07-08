@@ -1,0 +1,28 @@
+# Skill 治理结论
+
+- Skill：`codex-task-continuity`
+- 结论：先作为仓库内候选 Skill 编写和测试；实现验证后建议写入全局短入口，并更新 Obsidian C 点索引。
+- 理由：
+  - 这是跨项目、跨对话、跨天的默认任务记忆能力，属于入口型工作流。
+  - 它和 `program-workspace-governance`、`context-summary-card` 有联动价值，但必须独立运行，避免组件耦合。
+  - 如果写入全局，只应写“当用户问任务、待办、昨天做到哪、等待确认时使用该 Skill”这样的短入口。
+- 需要修改：
+  - 后续实现 `codex-task-continuity/SKILL.md`。
+  - 后续实现 task ledger CLI 和 Hook。
+  - 实现后更新 `Codex Skills 搜索索引.md` 和 `Codex 变更日志.md`。
+- 不需要修改：
+  - 本轮不修改全局 `AGENTS.md`。
+  - 本轮不安装到 `/Users/dysania/.codex/skills`。
+  - 本轮不写 Hook 配置。
+- 触发词建议：
+  - `我还有哪些任务`
+  - `昨天做到哪了`
+  - `等待我确认`
+  - `放到待做`
+  - `这个先暂放`
+  - `任务摘要`
+  - `每日待办`
+- 验证建议：
+  - 用合成 transcript 测试任务提取。
+  - 用合成 `needs-review` 和 `trash-candidates` 测试导入。
+  - 用并发写入测试验证 task ledger 不损坏。
