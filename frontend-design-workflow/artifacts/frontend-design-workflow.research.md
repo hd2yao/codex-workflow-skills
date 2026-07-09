@@ -63,3 +63,30 @@ P1：
 P2：
 
 - 若 UIUX Pro Max 的查询库稳定有价值，再独立评估是否安装为手动调用 skill。
+
+## Round 02 补充判断
+
+用户提供的二次分析整体可取，但应收敛成当前 skill 的增强版，而不是立刻拆成 6-7 个子 skill。
+
+新增核对来源：
+
+| 候选 | 来源 | 证据等级 | 采用判断 |
+|---|---|---|---|
+| StyleSeed | https://github.com/bitjaru/styleseed | A | 吸收 Design Lock、Quality Gate、反 AI 味规则；不全量安装或搬运其组件/规则库。 |
+| 21st.dev Magic MCP | https://github.com/21st-dev/magic-mcp | A | 作为“组件来源层”概念；因需要 API key 和外部生成能力，不默认接入。 |
+| Visual Verdict | https://github.com/vibeeval/vibecosystem/blob/main/skills/visual-verdict/SKILL.md | A | 吸收截图评分维度、PASS/REVISE/FAIL、迭代上限；抽象为工具无关流程。 |
+| Browser QA / ECC | https://github.com/affaan-m/ECC/blob/main/skills/browser-qa/SKILL.md | A | 吸收真实浏览器验证、只读优先、安全边界、无 baseline 则 INCONCLUSIVE 的思想。 |
+
+采纳进 `SKILL.md`：
+
+- 三层设计记忆：全局 UI 规则、项目 `DESIGN.md`、页面 `VISUAL_ACCEPTANCE.md` / 截图历史。
+- Design Lock：设计契约或项目 `DESIGN.md` 确认后，后续迭代必须说明保持/修改/废弃原因。
+- Visual Verdict：布局、字体、色彩、响应式、交互状态、内容完整度、参考一致度、反 AI 味，默认 90 PASS / 70-89 REVISE / <70 FAIL。
+- Fix 循环：每轮最多修 3 个最高影响问题，最多 5 轮；连续两轮提升不足时回到参考拆解或设计契约。
+- 组件来源层：先项目内组件，再参考项目结构，最后外部组件来源；外部来源不决定整体视觉。
+
+暂不采纳：
+
+- 不拆 `ui-master / ui-brief / reference-analyzer / design-system / ui-implementer / visual-reviewer / ui-fixer` 多 skill 架构。当前还没经过真实项目压力测试，过早拆分会增加触发混乱。
+- 不强制每次落盘 `PRODUCT_UI_BRIEF.md`、`REFERENCE_ANALYSIS.md`、`DESIGN.md`。小任务在聊天中输出；中大型或跨轮任务才落盘。
+- 不默认接入 21st.dev Magic MCP、Visual Verdict 原 skill、Browser QA 原 skill 或 StyleSeed hooks。
