@@ -41,7 +41,8 @@ class ThreadHealthGuardTest(unittest.TestCase):
 
         self.assertEqual(result["risk_level"], "high")
         self.assertTrue(result["should_create_new_thread"])
-        self.assertEqual(result["recommended_action"], "create_new_thread")
+        self.assertEqual(result["recommended_action"], "create_clean_continuation_thread")
+        self.assertEqual(result["migration_kind"], "clean_continuation")
 
     def test_long_context_alone_is_not_high_risk(self):
         result = thread_health_guard.score_snapshot(
@@ -65,6 +66,58 @@ class ThreadHealthGuardTest(unittest.TestCase):
 
         self.assertEqual(result["risk_level"], "medium")
         self.assertFalse(result["should_create_new_thread"])
+
+    def test_phase_transition_after_commit_triggers_clean_continuation(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=20_000,
+                cards=0,
+                messages=[
+                    ("用户", "M1 阶段已完成并 commit，接下来进入 M2 核心功能实现。"),
+                ],
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "high")
+        self.assertTrue(result["should_create_new_thread"])
+        self.assertGreaterEqual(result["scores"]["phase_transition"], 4)
+        self.assertIn("docs/HANDOFF.md", result["handoff_first_files"])
+        self.assertIn("README.md", result["new_thread_prompt_suffix"])
+
+    def test_migration_blockers_defer_otherwise_high_risk_migration(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=130_000,
+                cards=2,
+                messages=[
+                    ("用户", "M1 阶段已完成并 commit，接下来进入 M2。"),
+                    ("助手", "测试还在跑，等待输出。"),
+                ],
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertFalse(result["should_create_new_thread"])
+        self.assertEqual(result["recommended_action"], "finish_current_closure_before_migration")
+        self.assertTrue(result["migration_blockers"])
+
+    def test_meta_guidance_does_not_trigger_phase_transition(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=20_000,
+                cards=0,
+                messages=[
+                    (
+                        "用户",
+                        "评审一下这个建议：比如 M1 完成并 commit 后，下一阶段可以开新线程。",
+                    ),
+                ],
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "low")
+        self.assertFalse(result["should_create_new_thread"])
+        self.assertEqual(result["scores"]["phase_transition"], 0)
 
     def test_suggested_title_keeps_source_hint(self):
         title = thread_health_guard.title_for_continuation("一个很长的线程标题", "abcdef123456")

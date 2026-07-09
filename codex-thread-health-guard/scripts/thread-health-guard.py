@@ -32,7 +32,42 @@ STRUGGLE_PATTERNS = (
     re.compile(r"\b(error|failed|failure|traceback|exception|timeout|blocked)\b", re.I),
 )
 
+PHASE_TRANSITION_PATTERNS = (
+    re.compile(r"(阶段|里程碑|milestone|M\d+).{0,24}(完成|结束|done|closed)", re.I),
+    re.compile(r"(完成|测试通过|验证通过).{0,24}(commit|提交)", re.I),
+    re.compile(r"(commit|提交|handoff|HANDOFF|交接).{0,32}(下一阶段|新阶段|M\d+|接下来)", re.I),
+    re.compile(r"(进入|开始|继续).{0,12}(M\d+|下一阶段|新阶段|整体审查|review|重构|UI|Console)", re.I),
+)
+
+MIGRATION_BLOCKER_PATTERNS = (
+    re.compile(r"(命令|测试|构建|安装).{0,16}(还在跑|正在跑|运行中|未结束|等待|pending)", re.I),
+    re.compile(r"(刚定位|已定位).{0,24}(根因|原因).{0,24}(准备|下一步).{0,12}(改|修)", re.I),
+    re.compile(r"(还没|尚未|未).{0,12}(验证|测试|跑完|闭环|提交|commit)", re.I),
+    re.compile(r"(不要|别|先别).{0,12}(开新线程|新开线程|迁移|接续)", re.I),
+)
+
+META_GUIDANCE_PATTERNS = (
+    re.compile(r"官方|社区|Reddit|GitHub issue|文档|资料|评审|对比|优化|建议"),
+    re.compile(r"什么时候(应该|不该)|哪些节点|实践建议|最终判断|比如|例如|这几种情况"),
+    re.compile(r"判断标准|触发条件|规则|信号|设计成|可以让旧线程|新线程第一句话"),
+)
+
 ABS_PATH_RE = re.compile(r"/(?:Users|home|tmp|var|opt|Volumes)/[^\s`'\"，。；；、)>\]]+")
+
+HANDOFF_FIRST_FILES = (
+    "docs/HANDOFF.md",
+    "README.md",
+    "当前 git status/diff",
+    "项目测试脚本和最近测试结果",
+    "最近 commit 记录",
+)
+
+NEW_THREAD_PROMPT_SUFFIX = (
+    "请先阅读 docs/HANDOFF.md、README.md、当前 git status/diff、项目测试脚本和最近 commit 记录。"
+    "你是在干净新线程中接手上一个 Codex 线程继续推进；不要重新设计已完成阶段。"
+    "先确认你理解的当前目标、已有进展、风险和下一步，然后继续执行。"
+    "不要假设完整旧线程都在上下文里；需要细节时读取 pack 中列出的 rollout 或 context card。"
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +103,14 @@ def count_matches(patterns: tuple[re.Pattern[str], ...], messages: list[tuple[st
     return count
 
 
+def signal_messages(messages: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [
+        (role, text)
+        for role, text in messages
+        if not any(pattern.search(text) for pattern in META_GUIDANCE_PATTERNS)
+    ]
+
+
 def project_roots_from_texts(snapshot: ThreadSnapshot) -> set[str]:
     roots: set[str] = set()
     texts = [snapshot.cwd, snapshot.workspace_hint]
@@ -87,7 +130,9 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
     context_score = 0
     pollution_score = 0
     struggle_score = 0
+    phase_transition_score = 0
     evidence: list[str] = []
+    messages_for_signals = signal_messages(snapshot.messages)
 
     if snapshot.tokens_used >= 180_000:
         context_score += 4
@@ -109,7 +154,7 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
         context_score += 1
         evidence.append("已有 1 张 context card")
 
-    user_messages = [(role, text) for role, text in snapshot.messages if role == "用户"]
+    user_messages = [(role, text) for role, text in messages_for_signals if role == "用户"]
     pollution_count = count_matches(POLLUTION_PATTERNS, user_messages)
     if pollution_count >= 2:
         pollution_score += 4
@@ -123,7 +168,7 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
         pollution_score += 2
         evidence.append(f"最近上下文混入多个项目路径: {', '.join(sorted(roots)[:3])}")
 
-    struggle_count = count_matches(STRUGGLE_PATTERNS, snapshot.messages)
+    struggle_count = count_matches(STRUGGLE_PATTERNS, messages_for_signals)
     if struggle_count >= 4:
         struggle_score += 4
         evidence.append(f"最近失败/报错/阻塞信号 {struggle_count} 次")
@@ -134,13 +179,36 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
         struggle_score += 1
         evidence.append("最近出现失败、报错或阻塞信号")
 
-    total = context_score + pollution_score + struggle_score
+    phase_count = count_matches(PHASE_TRANSITION_PATTERNS, messages_for_signals)
+    if phase_count >= 2:
+        phase_transition_score += 5
+        evidence.append(f"最近出现阶段完成/新阶段交接信号 {phase_count} 次")
+    elif phase_count == 1:
+        phase_transition_score += 4
+        evidence.append("最近出现阶段完成或新阶段交接信号")
+
+    migration_blockers = [
+        clean_inline(text, 220)
+        for _role, text in messages_for_signals
+        if any(pattern.search(text) for pattern in MIGRATION_BLOCKER_PATTERNS)
+    ]
+
+    total = context_score + pollution_score + struggle_score + phase_transition_score
     has_context_pressure = context_score >= 3
     has_contamination_or_struggle = pollution_score + struggle_score >= 3
+    has_phase_transition = phase_transition_score >= 4
 
-    if has_context_pressure and has_contamination_or_struggle and total >= 6:
+    would_create_new_thread = (
+        (has_context_pressure and has_contamination_or_struggle and total >= 6)
+        or has_phase_transition
+    )
+
+    if migration_blockers and would_create_new_thread:
+        risk_level = "medium"
+        recommended_action = "finish_current_closure_before_migration"
+    elif would_create_new_thread:
         risk_level = "high"
-        recommended_action = "create_new_thread"
+        recommended_action = "create_clean_continuation_thread"
     elif total >= 3 or context_score >= 2 or pollution_score + struggle_score >= 2:
         risk_level = "medium"
         recommended_action = "continue_current_thread"
@@ -155,10 +223,15 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
             "context": context_score,
             "pollution": pollution_score,
             "struggle": struggle_score,
+            "phase_transition": phase_transition_score,
         },
-        "should_create_new_thread": risk_level == "high",
+        "should_create_new_thread": risk_level == "high" and not migration_blockers,
         "recommended_action": recommended_action,
+        "migration_kind": "clean_continuation" if risk_level == "high" else "",
+        "migration_blockers": migration_blockers,
         "evidence": evidence,
+        "handoff_first_files": list(HANDOFF_FIRST_FILES),
+        "new_thread_prompt_suffix": NEW_THREAD_PROMPT_SUFFIX,
         "suggested_title": title_for_continuation(snapshot.title, snapshot.thread_id),
     }
 
@@ -248,6 +321,14 @@ def format_markdown(result: dict[str, Any]) -> str:
     lines.extend(f"- {item}" for item in evidence)
     if not evidence:
         lines.append("- 未发现高风险证据。")
+    blockers = result.get("migration_blockers") or []
+    if blockers:
+        lines.extend(["", "## 暂缓迁移原因", ""])
+        lines.extend(f"- {item}" for item in blockers)
+    first_files = result.get("handoff_first_files") or []
+    if first_files and result.get("should_create_new_thread"):
+        lines.extend(["", "## 新线程优先读取", ""])
+        lines.extend(f"- {item}" for item in first_files)
     if result.get("continuation_pack_path"):
         lines.extend(["", f"- Continuation pack: `{result['continuation_pack_path']}`"])
     return "\n".join(lines)
@@ -271,9 +352,11 @@ def main(argv: list[str] | None = None) -> int:
         result = {
             "risk_level": "unknown",
             "score": 0,
-            "scores": {"context": 0, "pollution": 0, "struggle": 0},
+            "scores": {"context": 0, "pollution": 0, "struggle": 0, "phase_transition": 0},
             "should_create_new_thread": False,
             "recommended_action": "health_check_failed",
+            "migration_kind": "",
+            "migration_blockers": [],
             "evidence": [clean_inline(str(exc), 500)],
         }
     if args.format == "markdown":
