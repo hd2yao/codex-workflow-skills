@@ -415,6 +415,63 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertFalse(temp_screenshot.exists())
             self.assertFalse(attachment.exists())
 
+    def test_daily_digest_filters_git_history_subtree_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            old_day = (dt.date.today() - dt.timedelta(days=4)).isoformat()
+            manifest_dir = governance_dir / "artifacts" / old_day
+            manifest_dir.mkdir(parents=True)
+
+            repo_root = program_root / "tools" / "agent-tools"
+            source_dir = repo_root / "codex-thread-bridge"
+            source_dir.mkdir(parents=True)
+            tracked_file = source_dir / "codex_thread_bridge.py"
+            tracked_file.write_text("print('bridge')\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "add", "codex-thread-bridge/codex_thread_bridge.py"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(
+                ["git", "-c", "user.name=Codex", "-c", "user.email=codex@example.invalid", "commit", "-m", "add bridge"],
+                cwd=repo_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "branch", "codex-thread-bridge-mvp"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "rm", "codex-thread-bridge/codex_thread_bridge.py"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            source_dir.mkdir()
+            (source_dir / "__pycache__").mkdir()
+            (source_dir / "__pycache__" / "codex_thread_bridge.cpython-313.pyc").write_bytes(b"cache")
+            subprocess.run(
+                ["git", "-c", "user.name=Codex", "-c", "user.email=codex@example.invalid", "commit", "-m", "remove bridge from main"],
+                cwd=repo_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            manifest_dir.joinpath("branch-residue.json").write_text(
+                json.dumps({"candidates": [{"path": str(source_dir)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["artifact_summary_count"], 0)
+            self.assertEqual(output["new_artifact_candidate_count"], 0)
+            self.assertNotIn("codex-thread-bridge", output["systemMessage"])
+
     def test_daily_digest_delays_project_like_manifest_candidates_until_aged(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -113,6 +113,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
 - “前日产物和待确认内容”展示的是待确认池中所有仍为 `pending` 的未归属候选，不只看昨天新增内容。
 - 待确认池不是“修改过的文件清单”，也不是审计日志。已纳入工作流的 Skill、Hook、AGENTS、Codex 配置、Git tracked 源码、Obsidian 正式笔记和已记录到工作成果账本的内容，都不应进入待确认池。
+- 如果候选路径是某个本地 Git 仓库里的源码子目录，并且它存在于当前分支、其他本地分支或 Git 历史中，即使当前分支只残留 `__pycache__`、`.DS_Store` 等缓存，也应视为“分支/项目状态提醒”，不要进入待确认产物池。
 - 新候选会进入 `pending-artifacts.json` 和 `pending-artifacts.md`；只要用户没有确认删除、暂放、归档或转待办，就会在后续摘要中继续出现。
 - 顶级容器目录不应进入待确认池，例如 `/Users/dysania/program`、`/Users/dysania/program/tools`、`/Users/dysania/program/documents`、`/Users/dysania/program/env`、`/Users/dysania/program/AI`；这类路径只是组织空间，不是可删除或待归档产物。
 - 明显临时过程截图会自动清理或移出待确认池，例如系统临时目录中的 `codex-clipboard-*.png`、未被 Obsidian 笔记引用的生成预览图。
@@ -152,6 +153,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 用户明确要求创建并已经沉淀的 Skill、Hook、自动化、CLI 或项目源码。
 - `.codex` 下的配置、hooks、skills、agents 文件。
 - Git 已跟踪的源文件、测试文件、README、构建脚本等项目组成部分。
+- 存在于本地 Git 当前分支、其他分支或历史里的源码子目录；这类路径代表未合并、切分支或项目迁移状态，不是待确认删除/归档产物。
 - Obsidian 中已归档到正式 PARA 目录的笔记和资源。
 - 已经直接加入 task ledger 的待办事项；它们应在“未完成任务”里展示。
 - Program 顶级组织目录或项目容器目录，例如 `/Users/dysania/program`、`tools`、`documents`、`env`、`AI`。
