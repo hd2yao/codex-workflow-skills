@@ -1,0 +1,4 @@
+interface:
+  display_name: "前端设计工作流"
+  short_description: "参考项目驱动的前端 UI 设计重构与截图验收闭环流程"
+  default_prompt: "使用 $frontend-design-workflow 基于参考项目重构这个前端界面。"
