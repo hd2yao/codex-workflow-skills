@@ -90,3 +90,30 @@ P2：
 - 不拆 `ui-master / ui-brief / reference-analyzer / design-system / ui-implementer / visual-reviewer / ui-fixer` 多 skill 架构。当前还没经过真实项目压力测试，过早拆分会增加触发混乱。
 - 不强制每次落盘 `PRODUCT_UI_BRIEF.md`、`REFERENCE_ANALYSIS.md`、`DESIGN.md`。小任务在聊天中输出；中大型或跨轮任务才落盘。
 - 不默认接入 21st.dev Magic MCP、Visual Verdict 原 skill、Browser QA 原 skill 或 StyleSeed hooks。
+
+## Round 03 真实项目压力测试
+
+压力项目：Codex Profile Switcher；参考项目：`shanggqm/codexU`。
+
+参考证据：
+
+- codexU commit：`9945149534d3acc0e06ef8068acde7416b1325fe`
+- 主窗口源码：`Sources/CodexUsageWidget/main.swift` 中 `UsageWidgetView`
+- 菜单弹窗源码：`Sources/CodexUsageWidget/UI/RuntimeViews.swift` 中 `RuntimeStatusMenuView`
+- 设计边界：`docs/DESIGN_SYSTEM.md`
+- 官方截图：`docs/screenshot-v0.3.0-*.png`、`docs/screenshot-v1.0.0-beta-menu-popover.png`
+
+观察结论：
+
+- codexU 把根窗口表面放在滚动层之外，内容区纵向滚动，footer 固定在窗口底部；窗口宽度被锁定，只有高度在明确 min/default/max 范围内变化。
+- Profile Switcher 上一版使用固定 1080 内容宽度，但窗口可任意缩小；documentView 宽度只约束为不小于 clipView，导致横向越界。
+- 上一版截图存在明显背景穿透、内容裁切和缺少底部外框，却仍被 Agent 以“截图已保存、结构已经对了、编译测试通过”判为完成。
+- 说明 Round 02 的评分项不够：必须增加有效截图定义、几何硬失败、严格复刻逐区对照和视觉 PASS 前禁止发布。
+
+Round 03 采用：
+
+- 严格复刻模式和参考基线。
+- 根表面 / 滚动层 / 固定层的几何模型。
+- 原生 min/default/max 与 Web 375/768/1440 的分支验收。
+- `INCONCLUSIVE` 结论：无有效截图证据时不得评分为 PASS。
+- 溢出、裁切、重叠、外框穿透和关键区域缺失直接 FAIL。
