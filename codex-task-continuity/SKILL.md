@@ -117,7 +117,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 如果候选路径是某个本地 Git 仓库里的源码子目录，并且它存在于当前分支、其他本地分支或 Git 历史中，即使当前分支只残留 `__pycache__`、`.DS_Store` 等缓存，也应视为“分支/项目状态提醒”，不要进入待确认产物池。
 - 新候选会进入 `pending-artifacts.json` 和 `pending-artifacts.md`；只要用户没有确认删除、暂放、归档或转待办，就会在后续摘要中继续出现。
 - 顶级容器目录不应进入待确认池，例如 `/Users/dysania/program`、`/Users/dysania/program/tools`、`/Users/dysania/program/documents`、`/Users/dysania/program/env`、`/Users/dysania/program/AI`；这类路径只是组织空间，不是可删除或待归档产物。
-- 明显临时过程截图会自动清理或移出待确认池，例如系统临时目录中的 `codex-clipboard-*.png`、未被 Obsidian 笔记引用的生成预览图。
+- 明显临时过程截图会自动清理或移出待确认池：Python 临时目录、`/tmp`、`/private/tmp` 下的 PNG/JPEG/GIF/WebP 图片不依赖文件名直接删除；未被 Obsidian 笔记引用且名称显示为预览/截图的生成附件也会清理。
 - 只有缺少上述归属证据的项目样目录才进入 aging，默认经过 3 个工作日仍无归属才提醒；周六、周日不累计。适用对象例如拉下来试玩的开源项目、demo、带 `.git`、`README.md`、`package.json`、`pyproject.toml` 等标记的未知目录。可用 `CODEX_PENDING_PROJECT_AGING_DAYS` 调整工作日数。
 - 每个待确认项都必须展示“内容”和“选择原因”：内容说明它是什么，选择原因说明它为什么被放入待确认池，例如来自会话产物记录、位于 `needs-review`、位于 `trash-candidates`、或项目样目录超过 aging 期。
 - 产物操作短语用于用户后续回复，例如 `删除 A02`、`暂放 A02`、`移到待办 A02`；不会因为摘要生成而自动删除或移动文件。
@@ -162,8 +162,9 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 
 可自动清理：
 
-- 系统临时目录中的截图、剪贴板图片、调试预览图。
+- 系统临时目录中的截图、剪贴板图片、唤醒测试图和调试预览图；覆盖 Python 临时目录、`/tmp` 与 `/private/tmp`，不要求文件名包含 `codex-clipboard`。
 - Obsidian 附件目录中未被任何笔记引用、且文件名显示为生成预览或临时截图的图片。
+- 项目目录、正式素材目录或 Obsidian 已引用附件中的图片不自动删除。
 
 延迟提醒：
 

@@ -624,9 +624,13 @@ def is_auto_deletable_transient_path(path):
     name = item.name.lower()
     if name.startswith("codex-clipboard-"):
         return True
-    temp_root = Path(tempfile.gettempdir()).resolve()
+    temp_roots = {
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),
+        Path("/private/tmp").resolve(),
+    }
     try:
-        if item.resolve().is_relative_to(temp_root):
+        if any(item.resolve().is_relative_to(root) for root in temp_roots):
             return True
     except OSError:
         pass

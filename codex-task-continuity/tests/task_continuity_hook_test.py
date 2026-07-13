@@ -423,6 +423,45 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertFalse(temp_screenshot.exists())
             self.assertFalse(attachment.exists())
 
+    def test_daily_digest_auto_deletes_images_from_posix_tmp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            manifest_dir = governance_dir / "artifacts" / dt.date.today().isoformat()
+            manifest_dir.mkdir(parents=True)
+
+            with tempfile.NamedTemporaryFile(
+                prefix="codex-wake-test-",
+                suffix=".png",
+                dir="/tmp",
+                delete=False,
+            ) as handle:
+                handle.write(b"png")
+                transient_image = Path(handle.name)
+            self.addCleanup(transient_image.unlink, missing_ok=True)
+
+            manifest_dir.joinpath("tmp-image-session.json").write_text(
+                json.dumps({"candidates": [{"path": str(transient_image)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["artifact_summary_count"], 0)
+            self.assertEqual(output["new_artifact_candidate_count"], 0)
+            self.assertFalse(transient_image.exists())
+
     def test_daily_digest_filters_git_history_subtree_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
