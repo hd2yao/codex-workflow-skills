@@ -113,11 +113,12 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
 - “前日产物和待确认内容”展示的是待确认池中所有仍为 `pending` 的未归属候选，不只看昨天新增内容。
 - 待确认池不是“修改过的文件清单”，也不是审计日志。已纳入工作流的 Skill、Hook、AGENTS、Codex 配置、Git tracked 源码、Obsidian 正式笔记和已记录到工作成果账本的内容，都不应进入待确认池。
+- `/Users/dysania/program/codex-workflow-skills` 和 `/Users/dysania/program/skills` 是明确的正式源码根；目录自身即使是 Git 仓库根、近期没有提交或跨过周末，也不进入待确认池。
 - 如果候选路径是某个本地 Git 仓库里的源码子目录，并且它存在于当前分支、其他本地分支或 Git 历史中，即使当前分支只残留 `__pycache__`、`.DS_Store` 等缓存，也应视为“分支/项目状态提醒”，不要进入待确认产物池。
 - 新候选会进入 `pending-artifacts.json` 和 `pending-artifacts.md`；只要用户没有确认删除、暂放、归档或转待办，就会在后续摘要中继续出现。
 - 顶级容器目录不应进入待确认池，例如 `/Users/dysania/program`、`/Users/dysania/program/tools`、`/Users/dysania/program/documents`、`/Users/dysania/program/env`、`/Users/dysania/program/AI`；这类路径只是组织空间，不是可删除或待归档产物。
 - 明显临时过程截图会自动清理或移出待确认池，例如系统临时目录中的 `codex-clipboard-*.png`、未被 Obsidian 笔记引用的生成预览图。
-- 项目样目录候选会先 aging，默认 3 天后仍无归属才提醒；例如拉下来试玩的开源项目、demo、带 `.git`、`README.md`、`package.json`、`pyproject.toml` 等标记的目录。可用 `CODEX_PENDING_PROJECT_AGING_DAYS` 调整天数。
+- 只有缺少上述归属证据的项目样目录才进入 aging，默认经过 3 个工作日仍无归属才提醒；周六、周日不累计。适用对象例如拉下来试玩的开源项目、demo、带 `.git`、`README.md`、`package.json`、`pyproject.toml` 等标记的未知目录。可用 `CODEX_PENDING_PROJECT_AGING_DAYS` 调整工作日数。
 - 每个待确认项都必须展示“内容”和“选择原因”：内容说明它是什么，选择原因说明它为什么被放入待确认池，例如来自会话产物记录、位于 `needs-review`、位于 `trash-candidates`、或项目样目录超过 aging 期。
 - 产物操作短语用于用户后续回复，例如 `删除 A02`、`暂放 A02`、`移到待办 A02`；不会因为摘要生成而自动删除或移动文件。
 - 已经由 `program-curator apply` 移动到 `needs-review` 或 `trash-candidates` 的内容，会通过对应目录进入摘要。
@@ -151,6 +152,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 不应该进入待确认池：
 
 - 用户明确要求创建并已经沉淀的 Skill、Hook、自动化、CLI 或项目源码。
+- `program/codex-workflow-skills`、`program/skills` 等明确的正式源码根及其内容。
 - `.codex` 下的配置、hooks、skills、agents 文件。
 - Git 已跟踪的源文件、测试文件、README、构建脚本等项目组成部分。
 - 存在于本地 Git 当前分支、其他分支或历史里的源码子目录；这类路径代表未合并、切分支或项目迁移状态，不是待确认删除/归档产物。
@@ -165,9 +167,9 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 
 延迟提醒：
 
-- 项目样目录不会当天进入待确认池，默认等 3 天。
+- 缺少正式归属证据的项目样目录不会当天进入待确认池，默认等 3 个工作日；周末不计入。
 - aging 只作用于目录候选；散落文档、总结、脚本仍可立即提醒。
-- 这是为了避免“刚拉下来试玩的项目”当天就打扰用户，同时又能在几天无后续时提醒确认去留。
+- 这是为了避免“刚拉下来试玩的项目”当天或刚过周末就打扰用户，同时又能在连续若干工作日无后续时提醒确认去留。
 
 ## 已完成工作规则
 

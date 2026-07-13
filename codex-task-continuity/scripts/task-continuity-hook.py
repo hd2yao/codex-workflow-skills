@@ -525,6 +525,7 @@ def is_managed_artifact_path(path):
     item = Path(path).expanduser()
     managed_roots = [
         codex_home(),
+        program_root() / "codex-workflow-skills",
         program_root() / "skills",
         obsidian_vault_root(),
     ]
@@ -565,7 +566,14 @@ def manifest_age_days(manifest_day):
         day = dt.date.fromisoformat(str(manifest_day))
     except ValueError:
         return pending_project_aging_days()
-    return (dt.date.today() - day).days
+    today = dt.date.today()
+    if day >= today:
+        return 0
+    return sum(
+        1
+        for offset in range(1, (today - day).days + 1)
+        if (day + dt.timedelta(days=offset)).weekday() < 5
+    )
 
 
 def should_delay_project_candidate(path, manifest_day):
