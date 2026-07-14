@@ -440,6 +440,35 @@ def obsidian_vault_root():
     return program_root() / "documents" / "obsidian_vault"
 
 
+def git_root_for_path(path):
+    item = Path(path).expanduser()
+    search_dir = item if item.is_dir() else item.parent
+    if not search_dir.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(search_dir), "rev-parse", "--show-toplevel"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip()).expanduser()
+
+
+def git_relative_path(item, root):
+    try:
+        relative = item.expanduser().resolve().relative_to(root.expanduser().resolve())
+    except (OSError, ValueError):
+        return item.name
+    value = relative.as_posix()
+    return value or "."
+
+
 def is_git_tracked_file(path):
     item = Path(path).expanduser()
     if not item.is_file():
@@ -457,16 +486,52 @@ def is_git_tracked_file(path):
     return result.returncode == 0
 
 
+def is_git_managed_subtree(path):
+    item = Path(path).expanduser()
+    if not item.is_dir():
+        return False
+    root = git_root_for_path(item)
+    if root is None:
+        return False
+    try:
+        if item.resolve() == root.resolve():
+            return False
+    except OSError:
+        return False
+    relative = git_relative_path(item, root)
+    try:
+        current = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--", relative],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+        if current.returncode == 0 and current.stdout.strip():
+            return True
+        historical = subprocess.run(
+            ["git", "-C", str(root), "log", "--all", "--format=%H", "-n", "1", "--", relative],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return historical.returncode == 0 and bool(historical.stdout.strip())
+
+
 def is_managed_artifact_path(path):
     item = Path(path).expanduser()
     managed_roots = [
         codex_home(),
+        program_root() / "codex-workflow-skills",
         program_root() / "skills",
         obsidian_vault_root(),
     ]
     if any(is_relative_to_path(item, root) for root in managed_roots):
         return True
-    return is_git_tracked_file(item)
+    return is_git_tracked_file(item) or is_git_managed_subtree(item)
 
 
 def is_project_like_directory(path):
@@ -501,7 +566,14 @@ def manifest_age_days(manifest_day):
         day = dt.date.fromisoformat(str(manifest_day))
     except ValueError:
         return pending_project_aging_days()
-    return (dt.date.today() - day).days
+    today = dt.date.today()
+    if day >= today:
+        return 0
+    return sum(
+        1
+        for offset in range(1, (today - day).days + 1)
+        if (day + dt.timedelta(days=offset)).weekday() < 5
+    )
 
 
 def should_delay_project_candidate(path, manifest_day):
@@ -552,9 +624,13 @@ def is_auto_deletable_transient_path(path):
     name = item.name.lower()
     if name.startswith("codex-clipboard-"):
         return True
-    temp_root = Path(tempfile.gettempdir()).resolve()
+    temp_roots = {
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),
+        Path("/private/tmp").resolve(),
+    }
     try:
-        if item.resolve().is_relative_to(temp_root):
+        if any(item.resolve().is_relative_to(root) for root in temp_roots):
             return True
     except OSError:
         pass

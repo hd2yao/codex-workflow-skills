@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -11,6 +12,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "task-continuity-hook.py"
 LEDGER = ROOT / "scripts" / "task-ledger.py"
+
+
+def load_hook_module():
+    spec = importlib.util.spec_from_file_location("task_continuity_hook", HOOK)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def write_jsonl(path, records):
@@ -415,6 +423,152 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertFalse(temp_screenshot.exists())
             self.assertFalse(attachment.exists())
 
+    def test_daily_digest_auto_deletes_images_from_posix_tmp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            manifest_dir = governance_dir / "artifacts" / dt.date.today().isoformat()
+            manifest_dir.mkdir(parents=True)
+
+            with tempfile.NamedTemporaryFile(
+                prefix="codex-wake-test-",
+                suffix=".png",
+                dir="/tmp",
+                delete=False,
+            ) as handle:
+                handle.write(b"png")
+                transient_image = Path(handle.name)
+            self.addCleanup(transient_image.unlink, missing_ok=True)
+
+            manifest_dir.joinpath("tmp-image-session.json").write_text(
+                json.dumps({"candidates": [{"path": str(transient_image)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["artifact_summary_count"], 0)
+            self.assertEqual(output["new_artifact_candidate_count"], 0)
+            self.assertFalse(transient_image.exists())
+
+    def test_daily_digest_filters_git_history_subtree_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            old_day = (dt.date.today() - dt.timedelta(days=4)).isoformat()
+            manifest_dir = governance_dir / "artifacts" / old_day
+            manifest_dir.mkdir(parents=True)
+
+            repo_root = program_root / "tools" / "agent-tools"
+            source_dir = repo_root / "codex-thread-bridge"
+            source_dir.mkdir(parents=True)
+            tracked_file = source_dir / "codex_thread_bridge.py"
+            tracked_file.write_text("print('bridge')\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "add", "codex-thread-bridge/codex_thread_bridge.py"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(
+                ["git", "-c", "user.name=Codex", "-c", "user.email=codex@example.invalid", "commit", "-m", "add bridge"],
+                cwd=repo_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(["git", "branch", "codex-thread-bridge-mvp"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "rm", "codex-thread-bridge/codex_thread_bridge.py"], cwd=repo_root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            source_dir.mkdir()
+            (source_dir / "__pycache__").mkdir()
+            (source_dir / "__pycache__" / "codex_thread_bridge.cpython-313.pyc").write_bytes(b"cache")
+            subprocess.run(
+                ["git", "-c", "user.name=Codex", "-c", "user.email=codex@example.invalid", "commit", "-m", "remove bridge from main"],
+                cwd=repo_root,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            manifest_dir.joinpath("branch-residue.json").write_text(
+                json.dumps({"candidates": [{"path": str(source_dir)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["artifact_summary_count"], 0)
+            self.assertEqual(output["new_artifact_candidate_count"], 0)
+            self.assertNotIn("codex-thread-bridge", output["systemMessage"])
+
+    def test_daily_digest_filters_canonical_workflow_source_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            old_day = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+            manifest_dir = governance_dir / "artifacts" / old_day
+            manifest_dir.mkdir(parents=True)
+
+            workflow_repo = program_root / "codex-workflow-skills"
+            workflow_repo.mkdir(parents=True)
+            (workflow_repo / ".git").mkdir()
+            (workflow_repo / "README.md").write_text("# workflow skills", encoding="utf-8")
+            (workflow_repo / "codex-task-continuity").mkdir()
+            manifest_dir.joinpath("workflow-session.json").write_text(
+                json.dumps({"candidates": [{"path": str(workflow_repo)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["artifact_summary_count"], 0)
+            self.assertEqual(output["new_artifact_candidate_count"], 0)
+            self.assertNotIn("codex-workflow-skills", output["systemMessage"])
+
+    def test_project_aging_counts_workdays_instead_of_weekend_days(self):
+        hook = load_hook_module()
+        real_date = dt.date
+
+        class Monday(real_date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 7, 13)
+
+        try:
+            hook.dt.date = Monday
+            self.assertEqual(hook.manifest_age_days("2026-07-10"), 1)
+        finally:
+            hook.dt.date = real_date
+
     def test_daily_digest_delays_project_like_manifest_candidates_until_aged(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -422,7 +576,7 @@ class TaskContinuityHookTest(unittest.TestCase):
             program_root = tmp_path / "program"
             governance_dir = tmp_path / "program-governance"
             young_day = (dt.date.today() - dt.timedelta(days=1)).isoformat()
-            old_day = (dt.date.today() - dt.timedelta(days=3)).isoformat()
+            old_day = (dt.date.today() - dt.timedelta(days=7)).isoformat()
             young_manifest_dir = governance_dir / "artifacts" / young_day
             old_manifest_dir = governance_dir / "artifacts" / old_day
             young_manifest_dir.mkdir(parents=True)

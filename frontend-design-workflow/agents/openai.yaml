@@ -1,0 +1,4 @@
+interface:
+  display_name: "前端设计工作流"
+  short_description: "参考驱动的前端保真复刻与几何截图门禁"
+  default_prompt: "使用 $frontend-design-workflow 基于参考项目重构这个前端界面。"
