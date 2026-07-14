@@ -30,7 +30,7 @@
   验收：真实扫描能识别当前已知关键仓库；全仓测试通过；不修改任何被扫描项目。
   验证：真实 JSON 报告、Git status 对比、全仓 unittest。
 
-- [ ] **T007 安装、回流与交付**
+- [x] **T007 安装、回流与交付**
   映射：AC-010
   验收：同步全局 Skill/hook，更新 Obsidian 索引和变更日志；源码分支 push、PR 无 blocker 后自动 merge。
   验证：目录 diff、GitHub PR 状态、本地 main 与 origin/main 一致。
