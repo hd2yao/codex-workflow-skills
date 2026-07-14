@@ -79,7 +79,7 @@ heartbeat prompt 对每个可行动 finding 按顺序检查：
 3. 运行 fresh verification；失败立即停止，不创建 PR。
 4. dirty worktree 只有在文件范围、最终答复和验证三者一致时才 focused commit。
 5. push 当前分支，创建或复用 PR；检查 mergeable、冲突、review 和 checks。
-6. 无 blocker 时 `gh pr merge --merge --delete-branch`；更新本地默认分支并清理无 dirty 的已合并 worktree。
+6. 无 blocker 时 `gh pr merge --merge --delete-branch`；随后重新扫描确认 PR/分支状态，本地 worktree 与本地分支只报告待清理，不在本流程自动删除。
 7. 每次最多处理 3 个仓库；其余保留到下一次摘要。
 
 ## 第一性原理评审
@@ -106,7 +106,7 @@ heartbeat prompt 对每个可行动 finding 按顺序检查：
 - 临时 Git 仓库覆盖 clean、dirty、ahead、unmerged branch、外部 worktree。
 - fake `gh` 覆盖 open/merged PR、未登录、超时和无 PR。
 - Hook 测试覆盖新措辞、分类区块、JSON 字段、扫描失败降级。
-- 全仓 49 项既有测试加新增测试全部通过。
+- 全仓既有测试加新增测试全部通过。
 - 真实 `/Users/dysania/program` dry run 验证关键 finding。
 - 源码与全局安装副本 diff 为 0；真实 DailyDigest 用隔离 ledger 运行，不污染正式摘要状态。
 
