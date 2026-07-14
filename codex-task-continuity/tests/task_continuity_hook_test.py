@@ -563,8 +563,11 @@ class TaskContinuityHookTest(unittest.TestCase):
             def today(cls):
                 return cls(2026, 7, 13)
 
-        hook.dt.date = Monday
-        self.assertEqual(hook.manifest_age_days("2026-07-10"), 1)
+        try:
+            hook.dt.date = Monday
+            self.assertEqual(hook.manifest_age_days("2026-07-10"), 1)
+        finally:
+            hook.dt.date = real_date
 
     def test_daily_digest_delays_project_like_manifest_candidates_until_aged(self):
         with tempfile.TemporaryDirectory() as tmp:
