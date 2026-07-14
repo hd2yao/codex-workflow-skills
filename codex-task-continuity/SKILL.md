@@ -1,13 +1,13 @@
 ---
 name: codex-task-continuity
-description: Use when 用户询问还有哪些任务、想恢复之前的 Codex 工作、把想法放到待做/暂放/不要了、查看等待确认事项、查看已完成工作成果、生成每日任务摘要，或处理 Program needs-review/trash-candidates 未归属产物池。
+description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作、管理待做或等待确认事项、查看已完成成果、生成每日摘要，或需要检查本地仓库中未提交改动、未合并分支、worktree 与 PR 收尾状态时使用。
 ---
 
-# Codex Task Continuity
+# Codex 任务连续性
 
 ## 概要
 
-本技能用于维护跨对话、跨 Agent、跨天的任务连续性。它管理未完成任务、未归属待确认产物和已完成工作索引，不负责移动文件、生成上下文压缩摘要或完整整理 Obsidian 知识库。
+本技能用于维护跨对话、跨 Agent、跨天的任务连续性。它管理未完成任务、未归属待确认产物、已完成工作索引，以及本地 Git / PR 的待收尾事实；不负责自动续写未完成代码、生成上下文压缩摘要或完整整理 Obsidian 知识库。
 
 默认任务账本位置：
 
@@ -30,12 +30,20 @@ description: Use when 用户询问还有哪些任务、想恢复之前的 Codex 
 ~/.codex/work-ledger/index.md
 ```
 
+仓库收尾审计位置：
+
+```text
+~/.codex/task-ledger/repository-closure/latest.json
+~/.codex/task-ledger/repository-closure/latest.md
+```
+
 核心脚本位于本技能目录：
 
 ```text
 scripts/task-ledger.py
 scripts/task-continuity-hook.py
 scripts/work-ledger.py
+scripts/repository-closure-audit.py
 ```
 
 ## 何时使用
@@ -43,6 +51,7 @@ scripts/work-ledger.py
 - 用户问“我还有哪些任务”“昨天做到哪了”“哪些任务等我确认”。
 - 用户问“之前实现过什么”“这个功能做到哪一步”“有哪些技能已经做完”。
 - 用户说“这个放到待做”“先暂放”“这个不要了”“明天继续”。
+- 用户问“哪些分支还没合并”“有没有代码没提交”“这些任务真的都完成了吗”。
 - 需要把 `needs-review`、`trash-candidates`、artifact manifest 中未归属、未沉淀、可能是一时实验的遗留产物转成后续处理任务。
 - 需要把已完成或阶段完成的功能、技能、Hook、自动化记录成可检索清单。
 - 需要在 SessionStart、Stop、PreCompact 里读取或写入任务摘要。
@@ -78,6 +87,7 @@ python3 scripts/task-ledger.py import-artifacts --manifest PATH
 python3 scripts/work-ledger.py add --title "完成事项" --summary "做了什么"
 python3 scripts/work-ledger.py list
 python3 scripts/work-ledger.py sync-obsidian
+python3 scripts/repository-closure-audit.py --root /Users/dysania/program --include-github --format json
 ```
 
 需要机器可读输出时加：
@@ -91,8 +101,8 @@ python3 scripts/work-ledger.py sync-obsidian
 `task-continuity-hook.py` 支持：
 
 - `Stop`：只提取显式标记的任务，例如 `TODO:`、`待办：`、`等待确认：`、`阻塞：`、`想法：`。
-- `SessionStart`：每天最多打印一次当前未完成任务摘要，作为定时自动化的兜底。
-- `DailyDigest`：生成当日任务摘要并打印，供 Codex 定时自动化调用；同时把 Program manifest、当前 `needs-review` 和 `trash-candidates` 中真正未归属的内容导入待确认产物池。输出使用 Markdown 卡片，产物包含稳定编号、内容概要、路径、选择原因和可回复操作短语。
+- `SessionStart`：每天最多打印一次当前未完成任务摘要，作为定时自动化的兜底；若当天已有仓库收尾报告则直接复用，避免重复网络读取。
+- `DailyDigest`：生成当日任务摘要并打印，供 Codex 定时自动化调用；先执行只读仓库收尾审计，再把 Program manifest、当前 `needs-review` 和 `trash-candidates` 中真正未归属的内容导入待确认产物池。输出使用 Markdown 卡片，产物包含稳定编号、内容概要、路径、选择原因和可回复操作短语。
 - `PreCompact`：打印当前未完成任务摘要，供压缩上下文保留。
 
 Hook 失败时必须继续主流程；不要因为任务记录失败中断用户当前工作。
@@ -111,6 +121,8 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 摘要会展示在自动化绑定线程，并保存到 `~/.codex/task-ledger/digests/daily/YYYY-MM-DD.md`；旧版 `~/.codex/task-ledger/daily/YYYY-MM-DD.md` 只作为历史兼容清理目录。
 - 每次生成摘要时会自动滚动归档：已结束周的 daily 合成 `digests/weekly/YYYY-MM-DD_to_YYYY-MM-DD.md` 后删除来源 daily；已结束月的 weekly/daily 合成 `digests/monthly/YYYY-MM.md` 后删除来源 weekly/daily。
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
+- “账本已记录未完成”为 0，只表示 task ledger 当前没有活动记录，不能证明所有 Codex 对话和仓库工作都已完成；必须同时查看 Git / PR 收尾状态和相关任务上下文。
+- “Git / PR 收尾状态”按进行中 / 证据不足、待集成、PR 待处理、历史遗留、已合并待清理分类；扫描失败以警告展示，不阻塞日报。
 - “前日产物和待确认内容”展示的是待确认池中所有仍为 `pending` 的未归属候选，不只看昨天新增内容。
 - 待确认池不是“修改过的文件清单”，也不是审计日志。已纳入工作流的 Skill、Hook、AGENTS、Codex 配置、Git tracked 源码、Obsidian 正式笔记和已记录到工作成果账本的内容，都不应进入待确认池。
 - `/Users/dysania/program/codex-workflow-skills` 和 `/Users/dysania/program/skills` 是明确的正式源码根；目录自身即使是 Git 仓库根、近期没有提交或跨过周末，也不进入待确认池。
@@ -122,7 +134,48 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 每个待确认项都必须展示“内容”和“选择原因”：内容说明它是什么，选择原因说明它为什么被放入待确认池，例如来自会话产物记录、位于 `needs-review`、位于 `trash-candidates`、或项目样目录超过 aging 期。
 - 产物操作短语用于用户后续回复，例如 `删除 A02`、`暂放 A02`、`移到待办 A02`；不会因为摘要生成而自动删除或移动文件。
 - 已经由 `program-curator apply` 移动到 `needs-review` 或 `trash-candidates` 的内容，会通过对应目录进入摘要。
-- “最近完成”读取 `~/.codex/work-ledger/index.json`，只展示最近少量完成项；完整历史看 `index.md` 或 Obsidian 镜像。
+- “最近成果记录”读取 `~/.codex/work-ledger/index.json`，展示状态与更新时间；它是历史成果索引，不等于“今天完成”，完整历史看 `index.md` 或 Obsidian 镜像。
+
+## 仓库收尾审计
+
+`repository-closure-audit.py` 是确定性、只读扫描器。它发现配置根目录下的 Git checkout，并通过 `git worktree list` 补入登记在外部的 worktree；默认只收集状态和计数，不读取或输出工作文件内容。
+
+扫描事实包括：
+
+- tracked / untracked 改动计数、当前分支、detached 状态、upstream、ahead / behind。
+- 默认分支基准、尚未进入基准的本地分支、已经合并但仍占用的 worktree。
+- 使用 `--include-github` 时读取开放 PR 的 draft、merge state、review 与 checks 元数据。
+- 每项发现生成稳定 `RC-...` 编号；默认超过 30 天近期窗口的分支或 PR 归为历史遗留，不直接视为可合并。手动扫描可用 `--recent-days` 调整窗口。
+
+同一分支可以同时产生多个事实，例如“脏 worktree”与“已有开放 PR”。自动化判断时，`进行中 / 证据不足` 优先阻断任何写操作；其余分类用于说明分支或 PR 还处于哪一层收尾状态，不能覆盖脏工作区阻断。
+
+可用环境变量：
+
+```text
+CODEX_REPOSITORY_SCAN_ROOTS
+CODEX_REPOSITORY_CLOSURE_DIR
+CODEX_REPOSITORY_CLOSURE_INCLUDE_GITHUB
+CODEX_REPOSITORY_CLOSURE_TIMEOUT_SECONDS
+```
+
+多个扫描根目录使用系统路径分隔符连接。单个仓库的 Git 或 `gh` 读取失败只生成警告，不能中断其他仓库或主任务。
+
+## 自动提交、PR 与合并边界
+
+仓库扫描器和 Hook 始终只读。只有每日 recurring automation 中运行的 Agent 才能根据扫描结果、相关 Codex 任务上下文和仓库证据执行写操作。
+
+自动收尾必须同时满足：
+
+1. 能定位到相关任务或对话，且已有明确完成结论，没有遗留实现步骤或等待用户选择。至少同时满足“线程项目目录或 cwd 与 worktree 一致”以及“最终答复中的分支、改动文件、commit 或验证证据之一与扫描事实一致”；只靠标题相似不算关联成功。
+2. 改动文件与该任务范围能够一一对应；未知 untracked 文件不得默认加入提交。
+3. 在当前 HEAD 上重新执行最快相关验证并通过，再做 focused diff review。
+4. 当前分支不是默认分支、不是 detached HEAD，没有冲突、没有要求 force push 或重写历史。
+5. 远端仓库和 GitHub 登录身份匹配；PR 可创建或复用，且不存在 changes requested、失败检查或不可合并状态。
+6. 准备合并的 PR 不是仍需讨论的 draft，merge state 清晰，所需检查和评审均已满足。
+
+满足全部门槛后，可依次执行 focused commit、push、创建或复用 PR，并直接使用 merge commit 合并和删除远端分支；用户已授权此类合并不需要逐次再次确认。单次自动化最多处理 3 个仓库。合并后必须重新运行只读扫描，用稳定发现编号确认状态已消失或转为“已合并待清理”；只有存在精确关联项时才把 task ledger 更新为 `done` 或把成果 upsert 到 work ledger，避免重复运行制造重复记录。
+
+出现以下任一情况就停止写操作，只在日报报告下一步：任务仍未完成、上下文无法对应、测试失败、脏改动范围不明、默认分支或 detached HEAD、冲突、认证不匹配、PR 检查/评审未通过、需要 force、历史遗留分支无法证明仍有效、仓库禁止 merge commit、要求 merge queue 或分支保护策略无法由当前安全流程满足。不得绕过仓库保护、自动解决冲突、删除本地 worktree 或本地分支、不得把“有提交”当成“任务已完成”；干净的已合并 worktree 也只报告待清理，等待单独明确授权。
 
 ## 摘要留存策略
 
