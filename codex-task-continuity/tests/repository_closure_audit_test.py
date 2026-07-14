@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT_PATH = (
@@ -146,6 +148,43 @@ class RepositoryClosureAuditTests(unittest.TestCase):
 
         self.assertEqual([], inspected["pull_requests"])
         self.assertIn("gh unavailable", inspected["warnings"][0])
+
+    def test_github_query_only_reads_current_users_pull_requests(self):
+        repo = self.root / "github-author"
+        init_repo(repo)
+        captured = {}
+
+        def fake_run(args, **_kwargs):
+            captured["args"] = args
+            return SimpleNamespace(stdout="[]")
+
+        with mock.patch.object(
+            self.module,
+            "_git",
+            return_value=SimpleNamespace(stdout="git@github.com:example/demo.git"),
+        ), mock.patch.object(self.module, "_run", side_effect=fake_run):
+            self.module.github_pull_requests(repo)
+
+        self.assertIn("--author", captured["args"])
+        self.assertEqual("@me", captured["args"][captured["args"].index("--author") + 1])
+
+    def test_github_client_is_cached_across_worktrees_of_same_repository(self):
+        repo = self.root / "cached"
+        external = self.root / "cached-feature"
+        init_repo(repo)
+        git(repo, "branch", "feature/cache")
+        git(repo, "worktree", "add", str(external), "feature/cache")
+        calls = []
+
+        def delegate(path):
+            calls.append(Path(path))
+            return [{"number": 1}]
+
+        cached = self.module.cached_github_client(delegate)
+
+        self.assertEqual([{"number": 1}], cached(repo))
+        self.assertEqual([{"number": 1}], cached(external))
+        self.assertEqual(1, len(calls))
 
     def test_markdown_lists_counts_and_report_timestamp(self):
         repo = self.root / "markdown"

@@ -152,6 +152,8 @@ def github_pull_requests(repo):
             slug,
             "--state",
             "open",
+            "--author",
+            "@me",
             "--limit",
             "100",
             "--json",
@@ -160,6 +162,29 @@ def github_pull_requests(repo):
         timeout=30,
     )
     return json.loads(result.stdout)
+
+
+def cached_github_client(delegate=github_pull_requests):
+    """同一 Git common dir 的多个 worktree 只读取一次 GitHub。"""
+    cache = {}
+
+    def fetch(repo):
+        remote = _git(repo, "remote", "get-url", "origin", check=False).stdout.strip()
+        key = _github_slug(remote)
+        if not key:
+            common_raw = _git(repo, "rev-parse", "--git-common-dir").stdout.strip()
+            key = str(_resolve_git_path(repo, common_raw))
+        if key not in cache:
+            try:
+                cache[key] = (True, delegate(repo))
+            except Exception as exc:
+                cache[key] = (False, str(exc))
+        succeeded, value = cache[key]
+        if not succeeded:
+            raise RuntimeError(value)
+        return value
+
+    return fetch
 
 
 def _default_base_ref(worktree):
@@ -541,7 +566,7 @@ def main(argv=None):
         configured = os.environ.get("CODEX_REPOSITORY_SCAN_ROOTS")
         roots = configured.split(os.pathsep) if configured else [str(DEFAULT_ROOT)]
     discovered = discover_git_worktrees(roots)
-    gh_client = github_pull_requests if args.include_github else None
+    gh_client = cached_github_client() if args.include_github else None
     inspected = []
     warnings = []
     for worktree in discovered:
