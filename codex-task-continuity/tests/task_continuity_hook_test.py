@@ -31,6 +31,8 @@ def write_jsonl(path, records):
 def run_hook(hook_input, ledger_dir, extra_env=None):
     env = os.environ.copy()
     env["CODEX_TASK_LEDGER_DIR"] = str(ledger_dir)
+    env["CODEX_REPOSITORY_SCAN_ROOTS"] = str(Path(ledger_dir) / "repositories")
+    env["CODEX_REPOSITORY_CLOSURE_INCLUDE_GITHUB"] = "0"
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -231,6 +233,101 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(output["digest_path"], str(digest_daily_path(ledger_dir)))
             self.assertTrue(digest_daily_path(ledger_dir).exists())
             self.assertIn("整理候选继续项", digest_daily_path(ledger_dir).read_text(encoding="utf-8"))
+
+    def test_daily_digest_reports_git_closure_and_does_not_equate_empty_ledger_with_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            repo = tmp_path / "program" / "demo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Codex Test"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "codex-test@example.invalid"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            repo.joinpath("tracked.txt").write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
+            repo.joinpath("tracked.txt").write_text("unfinished\n", encoding="utf-8")
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {"CODEX_REPOSITORY_SCAN_ROOTS": str(tmp_path / "program")},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(0, output["task_count"])
+            self.assertEqual(1, output["repository_closure_count"])
+            self.assertEqual(1, output["repository_closure_counts"]["in_progress"])
+            self.assertIn("账本为 0 不代表所有 Codex 任务都已完成", output["systemMessage"])
+            self.assertIn("## Git / PR 收尾状态", output["systemMessage"])
+            self.assertIn("demo", output["systemMessage"])
+            self.assertTrue(Path(output["repository_closure_report_path"]).exists())
+
+    def test_session_start_reuses_today_repository_closure_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            closure_dir = ledger_dir / "repository-closure"
+            closure_dir.mkdir(parents=True)
+            report = {
+                "schema_version": 1,
+                "generated_at": f"{dt.date.today().isoformat()}T08:00:00+08:00",
+                "generated_on": dt.date.today().isoformat(),
+                "repository_count": 1,
+                "finding_count": 1,
+                "counts": {
+                    "in_progress": 0,
+                    "awaiting_integration": 1,
+                    "pr_pending": 0,
+                    "legacy": 0,
+                    "merged_cleanup": 0,
+                },
+                "findings": [
+                    {
+                        "id": "RC-EXAMPLE001",
+                        "category": "awaiting_integration",
+                        "repository": "demo",
+                        "worktree": "/tmp/demo",
+                        "branch": "feature/ready",
+                        "tracked_change_count": 0,
+                        "untracked_count": 0,
+                        "ahead_count": 1,
+                        "behind_count": 0,
+                        "reason": "分支含有尚未进入默认分支的提交",
+                    }
+                ],
+                "warnings": [],
+            }
+            closure_dir.joinpath("latest.json").write_text(
+                json.dumps(report, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "SessionStart"},
+                ledger_dir,
+                {
+                    "CODEX_REPOSITORY_CLOSURE_DIR": str(closure_dir),
+                    "CODEX_REPOSITORY_CLOSURE_SCANNER": str(tmp_path / "missing-scanner.py"),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(1, output["repository_closure_count"])
+            self.assertEqual([], output["repository_closure_warnings"])
+            self.assertIn("feature/ready", output["systemMessage"])
 
     def test_daily_digest_removes_old_persisted_markdown_summaries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -704,9 +801,10 @@ class TaskContinuityHookTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             output = json.loads(result.stdout)
-            self.assertIn("## 最近完成", output["systemMessage"])
+            self.assertIn("## 最近成果记录", output["systemMessage"])
             self.assertIn("实现每日摘要待确认池", output["systemMessage"])
             self.assertIn("每日摘要展示所有未确认产物", output["systemMessage"])
+            self.assertIn("更新时间：2026-07-06T01:00:00Z", output["systemMessage"])
             self.assertEqual(output["recent_completed_work_count"], 1)
 
     def test_daily_digest_rolls_completed_week_and_removes_daily_sources(self):

@@ -74,6 +74,44 @@ def work_ledger_root():
     return Path(os.environ.get("CODEX_WORK_LEDGER_DIR", "~/.codex/work-ledger")).expanduser()
 
 
+def repository_closure_root():
+    return Path(
+        os.environ.get(
+            "CODEX_REPOSITORY_CLOSURE_DIR",
+            ledger_root() / "repository-closure",
+        )
+    ).expanduser()
+
+
+def repository_closure_scanner():
+    return Path(
+        os.environ.get(
+            "CODEX_REPOSITORY_CLOSURE_SCANNER",
+            Path(__file__).with_name("repository-closure-audit.py"),
+        )
+    ).expanduser()
+
+
+def repository_scan_roots():
+    configured = os.environ.get("CODEX_REPOSITORY_SCAN_ROOTS")
+    if configured:
+        return [Path(item).expanduser() for item in configured.split(os.pathsep) if item]
+    return [program_root()]
+
+
+def repository_closure_include_github():
+    return os.environ.get("CODEX_REPOSITORY_CLOSURE_INCLUDE_GITHUB", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def repository_closure_report_path(kind="json"):
+    return repository_closure_root() / f"latest.{kind}"
+
+
 def state_path():
     return ledger_root() / "state.json"
 
@@ -320,6 +358,82 @@ def recent_completed_work(limit=5):
         if work.get("status") in {"completed", "partial", "shipped"}
     ]
     return sorted(works, key=lambda item: (item.get("updated_at") or "", item.get("title") or ""), reverse=True)[:limit]
+
+
+def empty_repository_closure_report(warning=None):
+    warnings = [warning] if warning else []
+    return {
+        "schema_version": 1,
+        "generated_at": now_iso(),
+        "generated_on": local_today(),
+        "repository_count": 0,
+        "finding_count": 0,
+        "counts": {
+            "in_progress": 0,
+            "awaiting_integration": 0,
+            "pr_pending": 0,
+            "legacy": 0,
+            "merged_cleanup": 0,
+        },
+        "findings": [],
+        "warnings": warnings,
+    }
+
+
+def load_repository_closure_report():
+    path = repository_closure_report_path()
+    if not path.exists():
+        return None
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return report if isinstance(report, dict) else None
+
+
+def run_repository_closure_audit():
+    command = [
+        sys.executable,
+        str(repository_closure_scanner()),
+        "--format",
+        "json",
+        "--output-dir",
+        str(repository_closure_root()),
+    ]
+    for root in repository_scan_roots():
+        command.extend(["--root", str(root)])
+    if repository_closure_include_github():
+        command.append("--include-github")
+    try:
+        timeout = max(10, int(os.environ.get("CODEX_REPOSITORY_CLOSURE_TIMEOUT_SECONDS", "180")))
+    except ValueError:
+        timeout = 180
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return empty_repository_closure_report(f"仓库收尾扫描未完成：{exc}")
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f"退出码 {result.returncode}"
+        return empty_repository_closure_report(f"仓库收尾扫描未完成：{detail}")
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return empty_repository_closure_report(f"仓库收尾扫描结果无法解析：{exc}")
+    return report if isinstance(report, dict) else empty_repository_closure_report("仓库收尾扫描结果格式无效")
+
+
+def repository_closure_report(source):
+    cached = load_repository_closure_report()
+    if source.lower() in {"sessionstart", "session_start"} and cached:
+        if cached.get("generated_on") == local_today():
+            return cached
+    return run_repository_closure_audit()
 
 
 def task_summary(tasks):
@@ -1013,21 +1127,23 @@ def upsert_pending_artifacts(entries):
     return [pending_entry_from_record(record) for record in active_pending_records(data)]
 
 
-def daily_card_markdown(tasks, artifacts, recent_work=None):
+def daily_card_markdown(tasks, artifacts, recent_work=None, repository_closure=None):
     recent_work = recent_work or []
+    repository_closure = repository_closure or empty_repository_closure_report()
     actions = artifact_actions(artifacts)
     lines = [
         "## Codex 每日任务摘要",
         "",
         f"**日期**：{local_today()}  ",
-        f"**未完成任务**：{len(tasks)}  ",
+        f"**账本已记录未完成**：{len(tasks)}  ",
+        f"**Git / PR 待收尾**：{repository_closure.get('finding_count', 0)}  ",
         f"**产物待确认**：{len(actions)}",
         "",
-        "## 未完成任务",
+        "## 任务账本中的未完成任务",
         "",
     ]
     if not tasks:
-        lines.append("- 当前没有记录到未完成任务。")
+        lines.append("- 任务账本当前为 0；账本为 0 不代表所有 Codex 任务都已完成。仍需结合 Git / PR 收尾状态与相关任务上下文判断。")
     else:
         for task in tasks:
             status = task.get("status", "")
@@ -1035,18 +1151,59 @@ def daily_card_markdown(tasks, artifacts, recent_work=None):
             next_action = markdown_label(task.get("next_action") or "未记录下一步")
             lines.append(f"- **{status}**：{title}（{project_label(task)}）")
             lines.append(f"  下一步：{next_action}")
-    lines.extend(["", "## 最近完成", ""])
+    closure_counts = repository_closure.get("counts", {})
+    lines.extend(
+        [
+            "",
+            "## Git / PR 收尾状态",
+            "",
+            "- 进行中 / 证据不足：{in_progress}；待集成：{awaiting_integration}；PR 待处理：{pr_pending}；历史遗留：{legacy}；已合并待清理：{merged_cleanup}。".format(
+                in_progress=closure_counts.get("in_progress", 0),
+                awaiting_integration=closure_counts.get("awaiting_integration", 0),
+                pr_pending=closure_counts.get("pr_pending", 0),
+                legacy=closure_counts.get("legacy", 0),
+                merged_cleanup=closure_counts.get("merged_cleanup", 0),
+            ),
+        ]
+    )
+    closure_findings = repository_closure.get("findings", [])
+    if not closure_findings:
+        lines.append("- 当前扫描范围内未发现待收尾 Git / PR 项；这仍不是对所有历史对话完成状态的证明。")
+    else:
+        category_labels = {
+            "in_progress": "进行中 / 证据不足",
+            "awaiting_integration": "待集成",
+            "pr_pending": "PR 待处理",
+            "legacy": "历史遗留",
+            "merged_cleanup": "已合并待清理",
+        }
+        for finding in closure_findings[:12]:
+            category = category_labels.get(finding.get("category"), finding.get("category", "未知"))
+            repository = markdown_label(finding.get("repository", "未知仓库"))
+            branch = markdown_label(finding.get("branch") or "(detached)")
+            finding_id = markdown_label(finding.get("id", ""))
+            reason = markdown_label(finding.get("reason", "待确认"))
+            lines.append(f"- **{category}** `{finding_id}`：{repository} / `{branch}`")
+            lines.append(f"  判断：{reason}")
+        if len(closure_findings) > 12:
+            lines.append(f"- 另有 {len(closure_findings) - 12} 项，详见仓库收尾报告。")
+    for warning in repository_closure.get("warnings", [])[:5]:
+        lines.append(f"- 扫描警告：{markdown_label(warning)}")
+
+    lines.extend(["", "## 最近成果记录", ""])
     if not recent_work:
-        lines.append("- 当前没有记录到最近完成工作。")
+        lines.append("- 当前没有记录到最近成果。")
     else:
         for work in recent_work:
             title = markdown_label(work.get("title", "未命名工作"))
             status = markdown_label(work.get("status", "completed"))
             summary = markdown_label(work.get("summary") or "未记录概要")
             usage = markdown_label(work.get("usage") or "未记录使用方式")
+            updated_at = markdown_label(work.get("updated_at") or "未记录")
             lines.append(f"- **{status}**：{title}")
             lines.append(f"  做了什么：{summary}")
             lines.append(f"  如何使用：{usage}")
+            lines.append(f"  更新时间：{updated_at}")
     lines.extend(["", "## 前日产物和待确认内容", ""])
     if not actions:
         lines.append("- 当前没有待确认产物。")
@@ -1194,11 +1351,12 @@ def daily_digest(source):
         return
     tasks = active_tasks()
     recent_work = recent_completed_work()
+    closure_report = repository_closure_report(source)
     new_artifacts = artifact_summary_entries()
     artifacts = upsert_pending_artifacts(new_artifacts)
     actions = artifact_actions(artifacts)
     deleted_daily_digests = cleanup_daily_digest_files()
-    summary = daily_card_markdown(tasks, artifacts, recent_work)
+    summary = daily_card_markdown(tasks, artifacts, recent_work, closure_report)
     saved_digest_path = save_daily_digest(summary)
     monthly_rollup_paths = rollup_completed_months()
     weekly_rollup_paths = rollup_completed_weeks()
@@ -1207,6 +1365,11 @@ def daily_digest(source):
         summary,
         task_count=len(tasks),
         recent_completed_work_count=len(recent_work),
+        repository_closure_count=closure_report.get("finding_count", 0),
+        repository_closure_counts=closure_report.get("counts", {}),
+        repository_closure_findings=closure_report.get("findings", []),
+        repository_closure_report_path=str(repository_closure_report_path("md")),
+        repository_closure_warnings=closure_report.get("warnings", []),
         artifact_summary_count=len(artifacts),
         artifact_actions=actions,
         new_artifact_candidate_count=len(new_artifacts),
