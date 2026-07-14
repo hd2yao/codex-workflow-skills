@@ -102,6 +102,32 @@ class RepositoryClosureAuditTests(unittest.TestCase):
             )["findings"][0]["id"],
         )
 
+    def test_clean_detached_worktree_is_evidence_insufficient(self):
+        repo = self.root / "detached"
+        init_repo(repo)
+        git(repo, "switch", "--detach")
+
+        inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
+        report = self.module.classify_findings([inspected], today=date(2026, 7, 14))
+
+        self.assertEqual(1, report["counts"]["in_progress"])
+        self.assertTrue(report["findings"][0]["detached"])
+        self.assertIn("detached", report["findings"][0]["reason"])
+
+    def test_unknown_default_branch_produces_warning(self):
+        repo = self.root / "unknown-default"
+        repo.mkdir()
+        git(repo, "init", "-b", "trunk")
+        git(repo, "config", "user.name", "Codex Test")
+        git(repo, "config", "user.email", "codex-test@example.invalid")
+        repo.joinpath("tracked.txt").write_text("initial\n", encoding="utf-8")
+        git(repo, "add", "tracked.txt")
+        git(repo, "commit", "-m", "initial")
+
+        inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
+
+        self.assertTrue(any("默认分支" in warning for warning in inspected["warnings"]))
+
     def test_matching_open_pr_changes_category_to_pr_pending(self):
         repo = self.root / "pr"
         init_repo(repo)

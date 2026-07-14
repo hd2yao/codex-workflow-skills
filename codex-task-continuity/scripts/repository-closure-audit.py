@@ -282,6 +282,7 @@ def inspect_worktree(path, *, gh_client=None, today=None):
     ).stdout.splitlines()
     untracked_count = sum(line.startswith("??") for line in status_lines)
     tracked_change_count = len(status_lines) - untracked_count
+    warnings = []
     upstream = _git(
         worktree,
         "rev-parse",
@@ -291,10 +292,11 @@ def inspect_worktree(path, *, gh_client=None, today=None):
         check=False,
     ).stdout.strip() or None
     base_ref = _default_base_ref(worktree)
+    if not base_ref:
+        warnings.append(f"{worktree}: 无法确定默认分支基准，仅报告可直接确认的状态")
     comparison_ref = upstream or base_ref
     ahead_count, behind_count = _ahead_behind(worktree, comparison_ref)
     remote_url = _git(worktree, "remote", "get-url", "origin", check=False).stdout.strip()
-    warnings = []
     pull_requests = []
     if gh_client is not None:
         try:
@@ -369,6 +371,25 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
             for pr in repo.get("pull_requests", [])
             if pr.get("headRefName")
         }
+
+        if repo.get("detached") and not repo.get("dirty"):
+            finding_id = _stable_id("detached", common_dir, None, repo["worktree"])
+            findings[finding_id] = {
+                "id": finding_id,
+                "category": "in_progress",
+                "original_category": None,
+                "repository": repo.get("github_repo") or Path(repo["top_level"]).name,
+                "worktree": repo["worktree"],
+                "branch": None,
+                "detached": True,
+                "tracked_change_count": 0,
+                "untracked_count": 0,
+                "ahead_count": repo.get("ahead_count", 0),
+                "behind_count": repo.get("behind_count", 0),
+                "pr": None,
+                "reason": "worktree 处于 detached HEAD，无法证明任务已安全收尾",
+                "updated_at": repo.get("inspected_on"),
+            }
 
         if repo.get("dirty"):
             finding_id = _stable_id("dirty", common_dir, current_branch, repo["worktree"])
