@@ -36,6 +36,114 @@ def fake_github_token():
 
 
 class TaskLedgerTest(unittest.TestCase):
+    def test_record_activity_upserts_by_thread_and_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "record-activity",
+                "--date",
+                "2026-07-14",
+                "--thread-id",
+                "thread-recipe",
+                "--title",
+                "设计菜谱库存系统",
+                "--status",
+                "delivered_pending_trial",
+                "--summary",
+                "PWA 已部署并通过测试",
+                "--next-action",
+                "使用真实食材试运行 1-3 天",
+                "--project-path",
+                "/Users/dysania/program/env/pantry-recipe-pwa",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-2],
+                    "--summary",
+                    "PWA 已部署，等待真实使用反馈",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            listed = run_ledger(
+                ["list-activity", "--date", "2026-07-14", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            activities = load_json(listed.stdout)["activities"]
+            self.assertEqual(1, len(activities))
+            self.assertEqual("thread-recipe", activities[0]["thread_id"])
+            self.assertEqual("delivered_pending_trial", activities[0]["status"])
+            self.assertIn("真实使用反馈", activities[0]["summary"])
+
+    def test_clear_activity_removes_only_requested_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            for day in ("2026-07-13", "2026-07-14"):
+                result = run_ledger(
+                    [
+                        "record-activity",
+                        "--date",
+                        day,
+                        "--thread-id",
+                        f"thread-{day}",
+                        "--title",
+                        "示例任务",
+                        "--status",
+                        "completed",
+                        "--summary",
+                        "完成",
+                        "--format",
+                        "json",
+                    ],
+                    ledger_dir,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            cleared = run_ledger(
+                ["clear-activity", "--date", "2026-07-14", "--format", "json"],
+                ledger_dir,
+            )
+            remaining = run_ledger(
+                ["list-activity", "--date", "2026-07-13", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertEqual(1, load_json(cleared.stdout)["removed_count"])
+            self.assertEqual(1, len(load_json(remaining.stdout)["activities"]))
+
+    def test_activity_date_must_be_iso_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            result = run_ledger(
+                [
+                    "record-activity",
+                    "--date",
+                    "../escape",
+                    "--title",
+                    "示例",
+                    "--status",
+                    "completed",
+                    "--summary",
+                    "完成",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("invalid activity date", result.stderr)
+
     def test_add_list_and_update_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"

@@ -36,6 +36,15 @@ ACTIVE_STATUSES = {
     "cleanup_candidate",
 }
 
+ACTIVITY_STATUSES = {
+    "completed",
+    "delivered_pending_trial",
+    "research_pending_implementation",
+    "in_progress",
+    "waiting_user",
+    "blocked",
+}
+
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"ghp_[A-Za-z0-9_]{20,}"),
@@ -103,6 +112,24 @@ def events_path(path):
     return path / "tasks.jsonl"
 
 
+def activity_dir(path):
+    return path / "activity"
+
+
+def activity_path(path, day):
+    return activity_dir(path) / f"{day}.json"
+
+
+def validate_activity_date(value):
+    try:
+        parsed = dt.date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid activity date: {value}") from exc
+    if parsed.isoformat() != str(value):
+        raise ValueError(f"invalid activity date: {value}")
+    return parsed.isoformat()
+
+
 def load_index(path):
     path = index_path(path)
     if not path.exists():
@@ -123,6 +150,37 @@ def save_index(path, data):
             json.dump(redact_value(data), handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
         temp_path.replace(index_path(path))
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def load_activity(path, day):
+    target = activity_path(path, day)
+    if not target.exists():
+        return {"version": 1, "date": day, "activities": {}}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "date": day, "activities": {}}
+    if not isinstance(data.get("activities"), dict):
+        data["activities"] = {}
+    data["version"] = 1
+    data["date"] = day
+    return data
+
+
+def save_activity(path, day, data):
+    target_dir = activity_dir(path)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = activity_path(path, day)
+    fd, temp_name = tempfile.mkstemp(prefix=f"activity-{day}.", suffix=".json", dir=str(target_dir))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(redact_value(data), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        temp_path.replace(target)
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -266,6 +324,55 @@ def update_task(args):
         save_index(path, data)
         append_event(path, "update", task)
     return {"task": task}
+
+
+def record_activity(args):
+    path = ledger_dir()
+    day = validate_activity_date(args.date)
+    if args.status not in ACTIVITY_STATUSES:
+        raise ValueError(f"unknown activity status: {args.status}")
+    thread_id = redact_text(args.thread_id).strip()
+    title = redact_text(args.title).strip()
+    stable_source = thread_id or f"{title}|{args.project_path}"
+    activity_id = hashlib.sha1(stable_source.encode("utf-8")).hexdigest()[:16]
+    activity = {
+        "id": activity_id,
+        "date": day,
+        "thread_id": thread_id,
+        "title": title,
+        "status": args.status,
+        "summary": redact_text(args.summary),
+        "next_action": redact_text(args.next_action),
+        "project_name": redact_text(args.project_name),
+        "project_path": redact_text(args.project_path),
+        "evidence": redact_text(args.evidence),
+        "updated_at": utc_now(),
+    }
+    with locked_ledger(path):
+        data = load_activity(path, day)
+        data["activities"][activity_id] = activity
+        save_activity(path, day, data)
+    return {"activity": activity}
+
+
+def list_activity(args):
+    day = validate_activity_date(args.date)
+    data = load_activity(ledger_dir(), day)
+    activities = sorted(
+        data["activities"].values(),
+        key=lambda item: (item.get("status") or "", item.get("title") or "", item.get("thread_id") or ""),
+    )
+    return {"date": day, "activities": activities}
+
+
+def clear_activity(args):
+    path = ledger_dir()
+    day = validate_activity_date(args.date)
+    with locked_ledger(path):
+        data = load_activity(path, day)
+        removed_count = len(data["activities"])
+        save_activity(path, day, {"version": 1, "date": day, "activities": {}})
+    return {"date": day, "removed_count": removed_count}
 
 
 def candidate_entries(root):
@@ -448,6 +555,17 @@ def print_result(result, output_format):
         task = result["task"]
         print(f"{task['id']} {task['status']} {task['title']}")
         return
+    if "activity" in result:
+        activity = result["activity"]
+        print(f"{activity['id']} {activity['status']} {activity['title']}")
+        return
+    if "activities" in result:
+        for activity in result["activities"]:
+            print(f"{activity['id']} {activity['status']} {activity['title']}")
+        return
+    if "removed_count" in result:
+        print(result["removed_count"])
+        return
     if "tasks" in result:
         for task in result["tasks"]:
             print(f"{task['id']} {task['status']} {task['title']}")
@@ -493,6 +611,29 @@ def build_parser():
     update.add_argument("--tags")
     update.add_argument("--format", choices=["text", "json"], default="text")
     update.set_defaults(func=update_task)
+
+    record_activity_cmd = subparsers.add_parser("record-activity")
+    record_activity_cmd.add_argument("--date", required=True)
+    record_activity_cmd.add_argument("--thread-id", default="")
+    record_activity_cmd.add_argument("--title", required=True)
+    record_activity_cmd.add_argument("--status", choices=sorted(ACTIVITY_STATUSES), required=True)
+    record_activity_cmd.add_argument("--summary", required=True)
+    record_activity_cmd.add_argument("--next-action", default="")
+    record_activity_cmd.add_argument("--project-name", default="")
+    record_activity_cmd.add_argument("--project-path", default="")
+    record_activity_cmd.add_argument("--evidence", default="")
+    record_activity_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    record_activity_cmd.set_defaults(func=record_activity)
+
+    list_activity_cmd = subparsers.add_parser("list-activity")
+    list_activity_cmd.add_argument("--date", required=True)
+    list_activity_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    list_activity_cmd.set_defaults(func=list_activity)
+
+    clear_activity_cmd = subparsers.add_parser("clear-activity")
+    clear_activity_cmd.add_argument("--date", required=True)
+    clear_activity_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    clear_activity_cmd.set_defaults(func=clear_activity)
 
     digest_cmd = subparsers.add_parser("digest")
     digest_cmd.add_argument("--date", default="")

@@ -102,7 +102,31 @@ class RepositoryClosureAuditTests(unittest.TestCase):
             )["findings"][0]["id"],
         )
 
-    def test_clean_detached_worktree_is_evidence_insufficient(self):
+    def test_inspection_separates_default_and_upstream_comparisons(self):
+        origin = self.root / "origin.git"
+        git(self.root, "init", "--bare", str(origin))
+        repo = self.root / "comparison"
+        init_repo(repo)
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "push", "-u", "origin", "main")
+        git(repo, "remote", "set-head", "origin", "main")
+        git(repo, "switch", "-c", "feature/compare")
+        (repo / "tracked.txt").write_text("feature one\n", encoding="utf-8")
+        git(repo, "commit", "-am", "feature one")
+        git(repo, "push", "-u", "origin", "feature/compare")
+        (repo / "tracked.txt").write_text("feature two\n", encoding="utf-8")
+        git(repo, "commit", "-am", "feature two")
+
+        inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
+
+        self.assertEqual(2, inspected["default_ahead_count"])
+        self.assertEqual(0, inspected["default_behind_count"])
+        self.assertEqual(1, inspected["upstream_ahead_count"])
+        self.assertEqual(0, inspected["upstream_behind_count"])
+        self.assertEqual("origin/main", inspected["default_comparison_ref"])
+        self.assertEqual("origin/feature/compare", inspected["upstream_comparison_ref"])
+
+    def test_clean_detached_worktree_already_in_default_is_cleanup(self):
         repo = self.root / "detached"
         init_repo(repo)
         git(repo, "switch", "--detach")
@@ -110,9 +134,9 @@ class RepositoryClosureAuditTests(unittest.TestCase):
         inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
         report = self.module.classify_findings([inspected], today=date(2026, 7, 14))
 
-        self.assertEqual(1, report["counts"]["in_progress"])
+        self.assertEqual(1, report["counts"]["merged_cleanup"])
         self.assertTrue(report["findings"][0]["detached"])
-        self.assertIn("detached", report["findings"][0]["reason"])
+        self.assertIn("可清理", report["findings"][0]["reason"])
 
     def test_unknown_default_branch_produces_warning(self):
         repo = self.root / "unknown-default"

@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex 任务连续性"
-  short_description: "追踪跨对话任务、每日摘要与本地仓库 Git/PR 收尾状态"
-  default_prompt: "使用 $codex-task-continuity 盘点任务账本、相关上下文和仓库收尾证据，并给出可安全执行的下一步。"
+  short_description: "追踪跨对话任务、周期运行、每日摘要与本地仓库收尾状态"
+  default_prompt: "使用 $codex-task-continuity 盘点昨日实际工作、周期任务、任务账本和仓库收尾证据，并优先执行高置信低风险的下一步。"

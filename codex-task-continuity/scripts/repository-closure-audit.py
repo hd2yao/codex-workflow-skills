@@ -224,11 +224,26 @@ def _ahead_behind(worktree, base, branch="HEAD"):
     return int(fields[1]), int(fields[0])
 
 
+def _tree_equivalent(worktree, base, branch):
+    if not base:
+        return False
+    return _git(worktree, "diff", "--quiet", base, branch, check=False).returncode == 0
+
+
+def _patch_equivalent(worktree, base, branch):
+    if not base:
+        return False
+    result = _git(worktree, "cherry", base, branch, check=False)
+    if result.returncode:
+        return False
+    return not any(line.startswith("+") for line in result.stdout.splitlines())
+
+
 def _branch_rows(worktree, base_ref):
     result = _git(
         worktree,
         "for-each-ref",
-        "--format=%(refname:short)|%(committerdate:iso8601-strict)",
+        "--format=%(refname:short)|%(committerdate:iso8601-strict)|%(upstream:short)",
         "refs/heads",
         check=False,
     )
@@ -237,28 +252,35 @@ def _branch_rows(worktree, base_ref):
     for line in result.stdout.splitlines():
         if not line:
             continue
-        branch, _, committed_at = line.partition("|")
+        branch, committed_at, upstream = (line.split("|", 2) + ["", ""])[:3]
         ahead, behind = _ahead_behind(worktree, base_ref, branch)
+        upstream_ahead, upstream_behind = _ahead_behind(worktree, upstream, branch)
         merged = branch == normalized_base
+        tree_equivalent = False
+        patch_equivalent = False
         if base_ref and branch != normalized_base:
-            merged = (
-                _git(
-                    worktree,
-                    "merge-base",
-                    "--is-ancestor",
-                    branch,
-                    base_ref,
-                    check=False,
-                ).returncode
+            ancestor_merged = (
+                _git(worktree, "merge-base", "--is-ancestor", branch, base_ref, check=False).returncode
                 == 0
             )
+            tree_equivalent = _tree_equivalent(worktree, base_ref, branch)
+            patch_equivalent = _patch_equivalent(worktree, base_ref, branch)
+            merged = ancestor_merged or tree_equivalent or patch_equivalent
         rows.append(
             {
                 "name": branch,
                 "committed_at": committed_at or None,
                 "ahead_count": ahead,
                 "behind_count": behind,
+                "default_ahead_count": ahead,
+                "default_behind_count": behind,
+                "upstream": upstream or None,
+                "upstream_ahead_count": upstream_ahead,
+                "upstream_behind_count": upstream_behind,
+                "remote_present": bool(upstream),
                 "merged": merged,
+                "tree_equivalent": tree_equivalent,
+                "patch_equivalent": patch_equivalent,
             }
         )
     return rows
@@ -294,8 +316,14 @@ def inspect_worktree(path, *, gh_client=None, today=None):
     base_ref = _default_base_ref(worktree)
     if not base_ref:
         warnings.append(f"{worktree}: 无法确定默认分支基准，仅报告可直接确认的状态")
-    comparison_ref = upstream or base_ref
-    ahead_count, behind_count = _ahead_behind(worktree, comparison_ref)
+    default_ahead_count, default_behind_count = _ahead_behind(worktree, base_ref)
+    upstream_ahead_count, upstream_behind_count = _ahead_behind(worktree, upstream)
+    head_ancestor_merged = bool(
+        base_ref
+        and _git(worktree, "merge-base", "--is-ancestor", "HEAD", base_ref, check=False).returncode == 0
+    )
+    head_tree_equivalent = _tree_equivalent(worktree, base_ref, "HEAD")
+    head_patch_equivalent = _patch_equivalent(worktree, base_ref, "HEAD")
     remote_url = _git(worktree, "remote", "get-url", "origin", check=False).stdout.strip()
     pull_requests = []
     if gh_client is not None:
@@ -315,8 +343,17 @@ def inspect_worktree(path, *, gh_client=None, today=None):
         "untracked_count": untracked_count,
         "upstream": upstream,
         "base_ref": base_ref,
-        "ahead_count": ahead_count,
-        "behind_count": behind_count,
+        "default_comparison_ref": base_ref,
+        "default_ahead_count": default_ahead_count,
+        "default_behind_count": default_behind_count,
+        "upstream_comparison_ref": upstream,
+        "upstream_ahead_count": upstream_ahead_count,
+        "upstream_behind_count": upstream_behind_count,
+        "ahead_count": default_ahead_count,
+        "behind_count": default_behind_count,
+        "head_merged": head_ancestor_merged or head_tree_equivalent or head_patch_equivalent,
+        "head_tree_equivalent": head_tree_equivalent,
+        "head_patch_equivalent": head_patch_equivalent,
         "remote_url": _sanitize_remote_url(remote_url),
         "github_repo": _github_slug(remote_url),
         "local_branches": _branch_rows(worktree, base_ref),
@@ -374,9 +411,18 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
 
         if repo.get("detached") and not repo.get("dirty"):
             finding_id = _stable_id("detached", common_dir, None, repo["worktree"])
+            if repo.get("head_merged"):
+                detached_category = "merged_cleanup"
+                detached_reason = "detached HEAD 已包含于默认分支，可清理该 worktree"
+            elif repo.get("default_ahead_count", 0) > 0:
+                detached_category = "awaiting_integration"
+                detached_reason = "detached HEAD 含默认分支尚未包含的提交，应先创建救援分支并推送"
+            else:
+                detached_category = "in_progress"
+                detached_reason = "worktree 处于 detached HEAD，且无法证明已安全收尾"
             findings[finding_id] = {
                 "id": finding_id,
-                "category": "in_progress",
+                "category": detached_category,
                 "original_category": None,
                 "repository": repo.get("github_repo") or Path(repo["top_level"]).name,
                 "worktree": repo["worktree"],
@@ -387,7 +433,8 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 "ahead_count": repo.get("ahead_count", 0),
                 "behind_count": repo.get("behind_count", 0),
                 "pr": None,
-                "reason": "worktree 处于 detached HEAD，无法证明任务已安全收尾",
+                "reason": detached_reason,
+                "suggested_action": "cleanup_worktree" if detached_category == "merged_cleanup" else "create_rescue_branch_and_push",
                 "updated_at": repo.get("inspected_on"),
             }
 
@@ -405,18 +452,26 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 "untracked_count": repo.get("untracked_count", 0),
                 "ahead_count": repo.get("ahead_count", 0),
                 "behind_count": repo.get("behind_count", 0),
+                "default_comparison_ref": repo.get("default_comparison_ref"),
+                "default_ahead_count": repo.get("default_ahead_count", 0),
+                "default_behind_count": repo.get("default_behind_count", 0),
+                "upstream_comparison_ref": repo.get("upstream_comparison_ref"),
+                "upstream_ahead_count": repo.get("upstream_ahead_count", 0),
+                "upstream_behind_count": repo.get("upstream_behind_count", 0),
                 "pr": prs_by_branch.get(current_branch),
                 "reason": "工作区存在尚未提交的改动，任务完成证据不足",
+                "suggested_action": "resolve_dirty_worktree",
                 "updated_at": repo.get("inspected_on"),
             }
 
         for branch_row in repo.get("local_branches", []):
             branch = branch_row["name"]
             if branch_row.get("merged"):
-                if branch == current_branch and branch != (repo.get("base_ref") or "").removeprefix("origin/"):
-                    category = "merged_cleanup"
-                else:
+                if branch == (repo.get("base_ref") or "").removeprefix("origin/"):
                     continue
+                if branch == current_branch and repo.get("dirty"):
+                    continue
+                category = "merged_cleanup"
             elif branch_row.get("ahead_count", 0) <= 0:
                 continue
             else:
@@ -444,12 +499,27 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 else 0,
                 "ahead_count": branch_row.get("ahead_count", 0),
                 "behind_count": branch_row.get("behind_count", 0),
+                "default_comparison_ref": repo.get("default_comparison_ref"),
+                "default_ahead_count": branch_row.get("default_ahead_count", 0),
+                "default_behind_count": branch_row.get("default_behind_count", 0),
+                "upstream_comparison_ref": branch_row.get("upstream"),
+                "upstream_ahead_count": branch_row.get("upstream_ahead_count", 0),
+                "upstream_behind_count": branch_row.get("upstream_behind_count", 0),
+                "remote_present": branch_row.get("remote_present", False),
+                "tree_equivalent": branch_row.get("tree_equivalent", False),
+                "patch_equivalent": branch_row.get("patch_equivalent", False),
                 "pr": prs_by_branch.get(branch),
                 "reason": {
                     "awaiting_integration": "分支含有尚未进入默认分支的提交",
                     "pr_pending": "分支已有开放 PR，尚未完成合并",
                     "legacy": "分支或 PR 超过近期窗口，需人工确认是否仍有效",
                     "merged_cleanup": "分支已进入默认分支，但 worktree 尚未清理",
+                }[category],
+                "suggested_action": {
+                    "awaiting_integration": "push_or_open_pr",
+                    "pr_pending": "finish_pr",
+                    "legacy": "preserve_remote_then_review",
+                    "merged_cleanup": "cleanup_worktree_and_branches",
                 }[category],
                 "updated_at": branch_row.get("committed_at"),
             }
@@ -500,7 +570,11 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
         counts[finding["category"]] += 1
     return {
         "schema_version": 1,
-        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": dt.datetime.now().astimezone().replace(
+            year=today.year,
+            month=today.month,
+            day=today.day,
+        ).isoformat(timespec="seconds"),
         "generated_on": today.isoformat(),
         "repository_count": len(inspected),
         "finding_count": len(ordered),
@@ -530,14 +604,14 @@ def render_markdown(report):
             [
                 "## 明细",
                 "",
-                "| ID | 分类 | 仓库 | 分支 | 改动 | ahead/behind | 说明 |",
-                "| --- | --- | --- | --- | ---: | ---: | --- |",
+                "| ID | 分类 | 仓库 | 分支 | 改动 | 默认分支 ahead/behind | upstream ahead/behind | 说明 |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | --- |",
             ]
         )
         for item in report["findings"]:
             changes = item["tracked_change_count"] + item["untracked_count"]
             lines.append(
-                "| {id} | {category} | {repo} | {branch} | {changes} | {ahead}/{behind} | {reason} |".format(
+                "| {id} | {category} | {repo} | {branch} | {changes} | {ahead}/{behind} | {upstream_ahead}/{upstream_behind} | {reason} |".format(
                     id=item["id"],
                     category=CATEGORY_LABELS[item["category"]],
                     repo=item["repository"],
@@ -545,6 +619,8 @@ def render_markdown(report):
                     changes=changes,
                     ahead=item["ahead_count"],
                     behind=item["behind_count"],
+                    upstream_ahead=item.get("upstream_ahead_count", 0),
+                    upstream_behind=item.get("upstream_behind_count", 0),
                     reason=item["reason"],
                 )
             )
@@ -576,6 +652,7 @@ def main(argv=None):
         help="要扫描的项目根目录；可重复。默认使用 CODEX_REPOSITORY_SCAN_ROOTS 或 /Users/dysania/program。",
     )
     parser.add_argument("--include-github", action="store_true", help="通过 gh 读取开放 PR 元数据。")
+    parser.add_argument("--refresh-remotes", action="store_true", help="扫描前对 origin 执行 fetch --prune。")
     parser.add_argument("--recent-days", type=int, default=30, help="超过该天数的发现归为历史遗留。")
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -590,8 +667,19 @@ def main(argv=None):
     gh_client = cached_github_client() if args.include_github else None
     inspected = []
     warnings = []
+    refreshed_common_dirs = set()
     for worktree in discovered:
         try:
+            common_dir = _resolve_git_path(
+                worktree,
+                _git(worktree, "rev-parse", "--git-common-dir").stdout.strip(),
+            )
+            if args.refresh_remotes and common_dir not in refreshed_common_dirs:
+                refreshed_common_dirs.add(common_dir)
+                refresh = _git(worktree, "fetch", "--prune", "origin", check=False)
+                if refresh.returncode:
+                    detail = refresh.stderr.strip() or refresh.stdout.strip() or "fetch --prune 失败"
+                    warnings.append(f"{worktree}: 远端刷新失败：{detail}")
             inspected.append(inspect_worktree(worktree, gh_client=gh_client))
         except Exception as exc:  # 单仓库失败不阻塞整份日报
             warnings.append(f"{worktree}: Git 扫描失败：{exc}")
