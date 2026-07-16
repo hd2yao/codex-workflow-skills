@@ -20,7 +20,7 @@ HOOK_SPEC.loader.exec_module(thread_health_guard_hook)
 
 
 class ThreadHealthGuardTest(unittest.TestCase):
-    def snapshot(self, *, tokens=0, cards=0, messages=None):
+    def snapshot(self, *, tokens=0, cards=0, messages=None, git_dirty=None):
         return thread_health_guard.ThreadSnapshot(
             thread_id="abc123456789",
             title="实现上下文迁移判断",
@@ -30,6 +30,7 @@ class ThreadHealthGuardTest(unittest.TestCase):
             context_card_count=cards,
             rollout_path="/tmp/thread.jsonl",
             messages=messages or [],
+            git_dirty=git_dirty,
         )
 
     def test_high_risk_requires_context_pressure_and_pollution_or_struggle(self):
@@ -139,6 +140,36 @@ class ThreadHealthGuardTest(unittest.TestCase):
         self.assertEqual(result["risk_level"], "high")
         self.assertTrue(result["should_create_new_thread"])
         self.assertFalse(result["migration_blockers"])
+
+    def test_stale_uncommitted_status_does_not_block_when_repo_clean(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=1_000_000,
+                messages=[
+                    ("助手", "测试已经过了，当前只有两个预期文件未提交：守卫脚本和它的单测。"),
+                ],
+                git_dirty=False,
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "high")
+        self.assertTrue(result["should_create_new_thread"])
+        self.assertFalse(result["migration_blockers"])
+
+    def test_uncommitted_status_still_blocks_when_repo_dirty(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=1_000_000,
+                messages=[
+                    ("助手", "测试已经过了，当前只有两个预期文件未提交：守卫脚本和它的单测。"),
+                ],
+                git_dirty=True,
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertFalse(result["should_create_new_thread"])
+        self.assertTrue(result["migration_blockers"])
 
     def test_meta_guidance_does_not_trigger_phase_transition(self):
         result = thread_health_guard.score_snapshot(

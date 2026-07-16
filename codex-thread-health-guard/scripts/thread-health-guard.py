@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -59,6 +60,11 @@ NON_BLOCKING_STATUS_PATTERNS = (
     re.compile(r"不属于这个 git 仓库|不包含在这个提交|已完成提交"),
 )
 
+STALE_WHEN_REPO_CLEAN_PATTERNS = (
+    re.compile(r"未提交|尚未.{0,12}(提交|commit)|还没.{0,12}(提交|commit)", re.I),
+    re.compile(r"没有.{0,12}(提交|commit)|待提交|pending commit", re.I),
+)
+
 ABS_PATH_RE = re.compile(r"/(?:Users|home|tmp|var|opt|Volumes)/[^\s`'\"，。；；、)>\]]+")
 
 HANDOFF_FIRST_FILES = (
@@ -87,6 +93,7 @@ class ThreadSnapshot:
     context_card_count: int
     rollout_path: str
     messages: list[tuple[str, str]]
+    git_dirty: bool | None = None
 
 
 def clean_inline(value: str, limit: int = 160) -> str:
@@ -120,6 +127,22 @@ def signal_messages(messages: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 def is_non_blocking_status(text: str) -> bool:
     return any(pattern.search(text) for pattern in NON_BLOCKING_STATUS_PATTERNS)
+
+
+def is_stale_repo_status(text: str, git_dirty: bool | None) -> bool:
+    return git_dirty is False and any(
+        pattern.search(text) for pattern in STALE_WHEN_REPO_CLEAN_PATTERNS
+    )
+
+
+def is_migration_blocker(text: str, git_dirty: bool | None) -> bool:
+    if not any(pattern.search(text) for pattern in MIGRATION_BLOCKER_PATTERNS):
+        return False
+    if is_non_blocking_status(text):
+        return False
+    if is_stale_repo_status(text, git_dirty):
+        return False
+    return True
 
 
 def project_roots_from_texts(snapshot: ThreadSnapshot) -> set[str]:
@@ -201,8 +224,7 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
     migration_blockers = [
         clean_inline(text, 220)
         for _role, text in messages_for_signals
-        if any(pattern.search(text) for pattern in MIGRATION_BLOCKER_PATTERNS)
-        and not is_non_blocking_status(text)
+        if is_migration_blocker(text, snapshot.git_dirty)
     ]
 
     total = context_score + pollution_score + struggle_score + phase_transition_score
@@ -262,6 +284,28 @@ def load_bridge_module() -> Any:
     return thread_bridge
 
 
+def detect_git_dirty(cwd: str) -> bool | None:
+    if not cwd:
+        return None
+    path = Path(cwd)
+    if not path.exists() or not path.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(path),
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def load_snapshot(codex_home: Path, thread_id: str, max_events: int) -> ThreadSnapshot:
     bridge = load_bridge_module()
     if thread_id:
@@ -282,6 +326,7 @@ def load_snapshot(codex_home: Path, thread_id: str, max_events: int) -> ThreadSn
         context_card_count=len(record.context_card_paths),
         rollout_path=str(record.rollout_path),
         messages=messages,
+        git_dirty=detect_git_dirty(record.cwd),
     )
 
 
@@ -337,6 +382,7 @@ def scan_recent(codex_home: Path, limit: int, max_events: int) -> dict[str, Any]
             context_card_count=len(record.context_card_paths),
             rollout_path=str(record.rollout_path),
             messages=messages,
+            git_dirty=detect_git_dirty(record.cwd),
         )
         score = score_snapshot(snapshot)
         threads.append(
