@@ -125,6 +125,21 @@ class ThreadHealthGuardTest(unittest.TestCase):
         self.assertEqual(result["recommended_action"], "finish_current_closure_before_migration")
         self.assertTrue(result["migration_blockers"])
 
+    def test_completed_status_message_does_not_block_migration(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(
+                tokens=1_000_000,
+                cards=0,
+                messages=[
+                    ("助手", "我不会在未提交编辑时切线程，但现在源码修正已经提交。"),
+                ],
+            )
+        )
+
+        self.assertEqual(result["risk_level"], "high")
+        self.assertTrue(result["should_create_new_thread"])
+        self.assertFalse(result["migration_blockers"])
+
     def test_meta_guidance_does_not_trigger_phase_transition(self):
         result = thread_health_guard.score_snapshot(
             self.snapshot(

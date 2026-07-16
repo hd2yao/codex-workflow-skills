@@ -54,6 +54,11 @@ META_GUIDANCE_PATTERNS = (
     re.compile(r"判断标准|触发条件|规则|信号|设计成|可以让旧线程|新线程第一句话"),
 )
 
+NON_BLOCKING_STATUS_PATTERNS = (
+    re.compile(r"不会在未提交|接下来我会提交|已经提交|提交完成|源码修正已经提交|验证通过"),
+    re.compile(r"不属于这个 git 仓库|不包含在这个提交|已完成提交"),
+)
+
 ABS_PATH_RE = re.compile(r"/(?:Users|home|tmp|var|opt|Volumes)/[^\s`'\"，。；；、)>\]]+")
 
 HANDOFF_FIRST_FILES = (
@@ -111,6 +116,10 @@ def signal_messages(messages: list[tuple[str, str]]) -> list[tuple[str, str]]:
         for role, text in messages
         if not any(pattern.search(text) for pattern in META_GUIDANCE_PATTERNS)
     ]
+
+
+def is_non_blocking_status(text: str) -> bool:
+    return any(pattern.search(text) for pattern in NON_BLOCKING_STATUS_PATTERNS)
 
 
 def project_roots_from_texts(snapshot: ThreadSnapshot) -> set[str]:
@@ -193,6 +202,7 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
         clean_inline(text, 220)
         for _role, text in messages_for_signals
         if any(pattern.search(text) for pattern in MIGRATION_BLOCKER_PATTERNS)
+        and not is_non_blocking_status(text)
     ]
 
     total = context_score + pollution_score + struggle_score + phase_transition_score
