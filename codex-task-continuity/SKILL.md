@@ -41,6 +41,8 @@ description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作
 ```text
 ~/.codex/task-ledger/repository-closure/latest.json
 ~/.codex/task-ledger/repository-closure/latest.md
+~/.codex/task-ledger/repository-closure/ignore.json
+~/.codex/task-ledger/repository-closure/resolutions/YYYY-MM-DD.json
 ```
 
 核心脚本位于本技能目录：
@@ -96,6 +98,8 @@ python3 scripts/task-ledger.py list-activity --date YYYY-MM-DD
 python3 scripts/task-ledger.py track-follow-up --thread-id THREAD_ID --title "目标" --goal "最终目标" --wait-condition "等待条件" --resume-mode auto --resume-action "条件满足后的动作" --monitor-automation-id AUTOMATION_ID --next-check-at ISO_TIME
 python3 scripts/task-ledger.py update-follow-up FOLLOW_UP_ID --last-checked-at ISO_TIME --next-check-at ISO_TIME
 python3 scripts/task-ledger.py list-follow-ups --status watching,ready,needs_attention
+python3 scripts/task-ledger.py record-repository-resolution --date YYYY-MM-DD --finding-id RC-ID --repository REPO --status completed --summary "已合并并清理" --next-action "无需操作"
+python3 scripts/task-ledger.py list-repository-resolutions --date YYYY-MM-DD
 python3 scripts/task-ledger.py import-curator --needs-review-dir PATH --trash-candidates-dir PATH
 python3 scripts/task-ledger.py import-artifacts --manifest PATH
 python3 scripts/work-ledger.py add --title "完成事项" --summary "做了什么"
@@ -142,14 +146,18 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
 - “账本已记录未完成”为 0，只表示 task ledger 当前没有活动记录，不能证明所有 Codex 对话和仓库工作都已完成；必须同时查看 Git / PR 收尾状态和相关任务上下文。
 - “昨日实际工作与后续”是日报第一主区块，来源是前一自然日实际活跃的 Codex 任务，而不是最近若干条 work ledger。状态区分 `completed`、`delivered_pending_trial`、`research_pending_implementation`、`in_progress`、`waiting_user` 和 `blocked`。
+- 昨日工作必须以准确项目名为第一识别信息，每项只展示状态、昨日结果和下一步；线程标题只作辅助。上下文卡片原文、证据路径和内部报告入口不进入用户卡片。
 - 活动账本缺失时，操作日志中的 `context_compacted` 事件按线程去重后成为降级活动，并从其上下文卡片“最近助手进展”提取至多两条短证据；Skill、Hook、Automation 和 Plugin 的已核实新增/更新/移除事件进入“昨日成果与系统变更”。
 - “等待条件与续作监控”来自结构化 follow-up，不从任意对话文本或 Automation prompt 猜测。外部条件进入等待前必须登记；自动续作绑定原线程的 ACTIVE heartbeat，并在每次检查后回写检查时间、下一检查和证据。
 - 单个 gate 等待不是整个目标 `blocked`。存在不污染等待证据、分支或业务状态的并行工作时，记录 `parallel_action` 并继续执行；所有安全轨道都无法推进时才标记全局阻塞。
 - 确定性且不需要业务选择的时间/状态条件默认 `resume_mode=auto`；只能通知或需要人工决策时分别使用 `notify`、`manual`。Automation 缺失、停用、投递线程不匹配或逾期未回写时，日报必须提示处理。
 - 已开发、测试或部署但尚未真实使用的成果必须标为“已交付待试用”，并给出最小试运行步骤；调研结论尚未应用时标为“调研完成待实施”。
-- 历史 work ledger 只保留索引链接，不在每日日报重复滚动展示旧条目；昨日成果必须来自昨日活动或操作日志证据。
+- 历史 work ledger 只作为内部 JSON 字段保留，不在每日日报展示旧条目或索引链接；昨日成果必须来自昨日活动或操作日志证据。
 - “周期任务运行状态”读取项目 `.codex/continuity.json`。只有计划时间、调度器状态、退出码以及结构化状态或成功日志的新鲜度一致时才报告正常；证据过期必须报告延迟，明确失败证据报告失败。
-- “Git / PR 收尾状态”按进行中 / 证据不足、待集成、PR 待处理、历史遗留、已合并待清理分类；扫描失败以警告展示，不阻塞日报。
+- “仓库收尾”只展示当日最终处置：已处理、近期开发暂不合并、需要关注。没有处置记录时最多展示 3 个优先候选，并写清项目、分支、当前阶段、准确原因和下一步；不得把“证据不足”、RC 编号或“详见报告”作为用户结论。
+- 仓库自动化先关联精确项目任务，再按仓库而非 finding 消耗每日动作预算；同一仓库的分支推送、合并和清理应尽量在一个动作批次内完成。只读分析、任务交接和忽略不占写预算。
+- 最近活动超过 15 天且没有近期任务继续证据时，默认优先自动收尾；近期仍在开发则保留分支并明确暂缓到什么条件。15 天只改变优先级，不允许 force push、猜测冲突、绕过测试或仓库保护。
+- 非本人项目、只读镜像或明确不再管理的仓库写入 `repository-closure/ignore.json`；忽略项必须在 fetch 前跳过，不产生扫描警告或日报条目。
 - “前日产物和待确认内容”展示的是待确认池中所有仍为 `pending` 的未归属候选，不只看昨天新增内容。
 - 待确认池不是“修改过的文件清单”，也不是审计日志。已纳入工作流的 Skill、Hook、AGENTS、Codex 配置、Git tracked 源码、Obsidian 正式笔记和已记录到工作成果账本的内容，都不应进入待确认池。
 - `/Users/dysania/program/codex-workflow-skills` 和 `/Users/dysania/program/skills` 是明确的正式源码根；目录自身即使是 Git 仓库根、近期没有提交或跨过周末，也不进入待确认池。
@@ -163,7 +171,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 每个待确认项都必须展示“内容”和“选择原因”：内容说明它是什么，选择原因说明它为什么被放入待确认池，例如来自会话产物记录、位于 `needs-review`、位于 `trash-candidates`、或项目样目录超过 aging 期。
 - 产物操作短语用于用户后续回复，例如 `删除 A02`、`暂放 A02`、`移到待办 A02`；不会因为摘要生成而自动删除或移动文件。
 - 已经由 `program-curator apply` 移动到 `needs-review` 或 `trash-candidates` 的内容，会通过对应目录进入摘要。
-- “历史成果索引”只链接 `~/.codex/work-ledger/index.md`，不再逐条展示 `index.json` 中的旧成果；昨日成果必须由昨日活动或操作日志证据提供。
+- `~/.codex/work-ledger/index.md` 继续供自动化内部检索，但不进入用户日报；昨日成果必须由昨日活动或操作日志证据提供。
 
 ## 仓库收尾审计
 
@@ -175,9 +183,10 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 默认分支基准、尚未进入基准的本地分支、已经合并但仍占用的 worktree。
 - 提交可达、tree 等价和 patch 等价证据；用于识别普通 merge、部分 squash 后的内容等价和干净 detached worktree。
 - 使用 `--include-github` 时读取开放 PR 的 draft、merge state、review 与 checks 元数据。
-- 每项发现生成稳定 `RC-...` 编号；默认超过 30 天近期窗口的分支或 PR 归为历史遗留，不直接视为可合并。手动扫描可用 `--recent-days` 调整窗口。
+- 每项发现生成稳定 `RC-...` 内部编号，并记录 `workflow_stage`、最近活动、`age_days`、处置方向和下一步。编号只用于账本关联，不向用户展示。
+- 默认 15 天为近期窗口；超过窗口的仓库进入优先自动收尾队列。手动扫描可用 `--recent-days` 调整窗口。
 
-自动化执行前先 `fetch --prune`。日报使用默认分支比较判断是否已集成，使用 upstream 比较判断是否已推送保存；两个口径不得混用。脏 worktree 优先阻断该 worktree 的分支清理或合并，但不应把其他干净分支全部降为“证据不足”。
+自动化执行前先应用持久忽略，再对纳管仓库执行 `fetch --prune`。日报使用默认分支比较判断是否已集成，使用 upstream 比较判断是否已推送保存；两个口径不得混用。脏 worktree 表示处在“整理未提交改动”阶段，不等于未知状态；对应任务应继续提交、测试和合并，近期仍活跃时才明确暂缓。
 
 ## 周期任务声明
 

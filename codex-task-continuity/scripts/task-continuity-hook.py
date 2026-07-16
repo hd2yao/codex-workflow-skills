@@ -12,7 +12,25 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-LEDGER = Path(__file__).with_name("task-ledger.py")
+def companion_script(name):
+    local = Path(__file__).with_name(name)
+    skill_root = Path(
+        os.environ.get(
+            "CODEX_TASK_CONTINUITY_SKILL_DIR",
+            "~/.codex/skills/codex-task-continuity",
+        )
+    ).expanduser()
+    installed = skill_root / "scripts" / name
+    if Path(__file__).parent.name == "hooks" and installed.exists():
+        return installed
+    if local.exists():
+        return local
+    if installed.exists():
+        return installed
+    return local
+
+
+LEDGER = companion_script("task-ledger.py")
 ACTIVE_STATUS = "idea,todo,in_progress,waiting_user,blocked,needs_review,cleanup_candidate"
 MARKERS = [
     (re.compile(r"^\s*(?:TODO|待办|下一步|需要继续|继续任务)\s*[:：]\s*(.+?)\s*$", re.I), "todo"),
@@ -121,7 +139,7 @@ def repository_closure_scanner():
     return Path(
         os.environ.get(
             "CODEX_REPOSITORY_CLOSURE_SCANNER",
-            Path(__file__).with_name("repository-closure-audit.py"),
+            companion_script("repository-closure-audit.py"),
         )
     ).expanduser()
 
@@ -130,7 +148,7 @@ def recurring_task_scanner():
     return Path(
         os.environ.get(
             "CODEX_RECURRING_TASK_SCANNER",
-            Path(__file__).with_name("recurring-task-audit.py"),
+            companion_script("recurring-task-audit.py"),
         )
     ).expanduser()
 
@@ -654,15 +672,18 @@ def operation_fallback_activities(events=None, limit=12):
         progress = context_card_recent_progress(event)
         if progress:
             summary = f"上下文卡片记录的最近进展：{progress}（仅作为昨日进展证据，不据此推断任务完成。）"
+            next_match = re.search(r"(?:下一步|后续)\s*[:：]?\s*([^。；]+)", progress)
+            next_action = next_match.group(1).strip() if next_match else "回到该项目任务继续尚未完成的步骤。"
         else:
             summary = "操作日志确认该任务昨日活跃并生成了上下文压缩卡片；线程接口采集失败，未据此推断完成状态。"
+            next_action = "回到该项目任务核对当前阶段并继续未完成步骤。"
         activities.append(
             {
                 "thread_id": thread_id,
                 "title": thread.get("title") or "未命名任务",
                 "status": "in_progress",
                 "summary": summary,
-                "next_action": "读取对应任务或项目证据，补齐实际结果与后续。",
+                "next_action": next_action,
                 "project_name": project.get("name") or "",
                 "project_path": project.get("path") or "",
                 "evidence": operation_evidence_label(event),
@@ -704,6 +725,118 @@ def previous_day_activity_bundle(operation_events=None):
 
 def previous_day_activities():
     return previous_day_activity_bundle()[0]
+
+
+def today_repository_resolutions():
+    try:
+        result = ledger_command(
+            [
+                "list-repository-resolutions",
+                "--date",
+                local_today(),
+                "--format",
+                "json",
+            ]
+        )
+    except RuntimeError:
+        return []
+    return [item for item in result.get("resolutions", []) if isinstance(item, dict)]
+
+
+def compact_digest_text(value, max_chars=120):
+    text = redact(value or "").strip()
+    for prefix in (
+        "上下文卡片记录的最近进展：",
+        "最近助手进展：",
+        "结果：",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].lstrip()
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    text = re.sub(r"（仅作为[^）]*）", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    boundary = max(text.rfind("。", 8, max_chars), text.rfind("；", 8, max_chars))
+    if boundary >= 8:
+        return text[: boundary + 1].strip()
+    return text[: max_chars - 1].rstrip("，,；;：: ") + "…"
+
+
+def activity_project_name(activity):
+    generic = {"", "program", "tools", "env", "ai", "无项目", "未知项目"}
+    name = str(activity.get("project_name") or "").strip()
+    if name.lower() not in generic:
+        return name
+    path = str(activity.get("project_path") or "").strip()
+    if path:
+        candidate = Path(path).name.strip()
+        if candidate.lower() not in generic:
+            return candidate
+    return str(activity.get("title") or "未命名项目").strip()
+
+
+def repository_stage_label(finding):
+    return {
+        "uncommitted_changes": "整理未提交改动",
+        "committed_not_merged": "提交已完成，尚未合并",
+        "pr_not_merged": "PR 尚未合并",
+        "stale_branch": "长期未活动分支",
+        "merged_cleanup": "已合并，等待清理",
+        "repository_review": "仓库状态检查",
+    }.get(finding.get("workflow_stage"), finding.get("workflow_stage") or "仓库状态检查")
+
+
+def append_repository_item(lines, item, *, resolution=False):
+    project = item.get("project_name") or item.get("repository") or "未知项目"
+    branch = item.get("branch") or "detached HEAD"
+    stage = item.get("stage") if resolution else repository_stage_label(item)
+    summary = item.get("summary") if resolution else item.get("reason")
+    next_action = item.get("next_action") or "由对应任务继续收尾。"
+    lines.append(
+        f"- **{markdown_label(project)}** / `{markdown_label(branch)}`：{markdown_label(stage or '仓库处理')}"
+    )
+    lines.append(f"  当前：{markdown_label(compact_digest_text(summary or '未记录当前状态'))}")
+    lines.append(f"  后续：{markdown_label(compact_digest_text(next_action))}")
+
+
+def repository_closure_lines(report, resolutions):
+    lines = ["", "## 仓库收尾", ""]
+    visible = [item for item in resolutions if item.get("status") != "ignored"]
+    if visible:
+        groups = (
+            ("今日已处理", {"completed"}),
+            ("近期开发暂不合并", {"active_deferred", "planned"}),
+            ("需要关注", {"failed"}),
+        )
+        for title, statuses in groups:
+            items = [item for item in visible if item.get("status") in statuses]
+            if not items:
+                continue
+            lines.extend([f"### {title}", ""])
+            for item in items:
+                append_repository_item(lines, item, resolution=True)
+        return lines
+
+    findings = report.get("findings", [])
+    if not findings:
+        lines.append("- 当前没有需要收尾的仓库。")
+        return lines
+    prioritized = sorted(
+        findings,
+        key=lambda item: (
+            0 if item.get("disposition") in {"auto_finish", "auto_cleanup"} else 1,
+            -(item.get("age_days") or 0),
+            item.get("repository") or "",
+        ),
+    )[:3]
+    lines.extend(["### 待自动处理", ""])
+    for item in prioritized:
+        append_repository_item(lines, item)
+    remaining = len(findings) - len(prioritized)
+    if remaining > 0:
+        lines.append(f"- 其余 {remaining} 项留在内部队列，后续按仓库级动作预算处理，不需要你逐项确认。")
+    return lines
 
 
 def recent_completed_work(limit=5):
@@ -1586,6 +1719,7 @@ def daily_card_markdown(
     daily_changes=None,
     activity_source="activity_ledger",
     follow_ups=None,
+    repository_resolutions=None,
 ):
     recent_work = recent_work or []
     repository_closure = repository_closure or empty_repository_closure_report()
@@ -1593,6 +1727,10 @@ def daily_card_markdown(
     recurring_tasks = recurring_tasks or empty_recurring_task_report()
     daily_changes = daily_changes or []
     follow_ups = follow_ups or []
+    repository_resolutions = repository_resolutions or []
+    visible_repository_resolutions = [
+        item for item in repository_resolutions if item.get("status") != "ignored"
+    ]
     actions = artifact_actions(artifacts)
     lines = [
         "## Codex 每日任务摘要",
@@ -1603,7 +1741,11 @@ def daily_card_markdown(
         f"**昨日已核实系统变更**：{len(daily_changes)}  ",
         f"**周期任务**：{recurring_tasks.get('task_count', len(recurring_tasks.get('tasks', [])))}  ",
         f"**续作监控**：{len(follow_ups)}  ",
-        f"**Git / PR 待收尾**：{repository_closure.get('finding_count', 0)}  ",
+        (
+            f"**本轮仓库处置**：{len(visible_repository_resolutions)}  "
+            if repository_resolutions
+            else f"**仓库优先候选**：{min(3, repository_closure.get('finding_count', 0))}  "
+        ),
         f"**产物待确认**：{len(actions)}",
         "",
         "## 昨日实际工作与后续",
@@ -1613,7 +1755,7 @@ def daily_card_markdown(
         lines.append("- 尚未记录前一自然日的 Codex 任务活动；这表示活动采集缺失，不表示昨天没有工作。")
     else:
         if activity_source == "operation_ledger_fallback":
-            lines.append("- 线程索引采集失败；以下使用操作日志降级证据，只确认任务昨日活跃，不把上下文压缩推断为任务完成。")
+            lines.append("- 活动记录使用操作日志补全；完成状态只按已核实结果标注。")
         activity_labels = {
             "completed": "已完成",
             "delivered_pending_trial": "已交付待试用",
@@ -1625,13 +1767,13 @@ def daily_card_markdown(
         for activity in previous_activity:
             status = activity_labels.get(activity.get("status"), activity.get("status") or "未知")
             title = markdown_label(activity.get("title") or "未命名任务")
-            summary = markdown_label(activity.get("summary") or "未记录工作结果")
-            next_action = markdown_label(activity.get("next_action") or "无后续动作")
-            evidence = markdown_label(activity.get("evidence") or "未记录证据")
-            lines.append(f"- **{status}**：{title}")
-            lines.append(f"  结果：{summary}")
+            project = markdown_label(activity_project_name(activity))
+            summary = markdown_label(compact_digest_text(activity.get("summary") or "未记录工作结果"))
+            next_action = markdown_label(compact_digest_text(activity.get("next_action") or "无后续动作"))
+            suffix = "" if title == project else f"：{title}"
+            lines.append(f"- **{status} · {project}**{suffix}")
+            lines.append(f"  昨日：{summary}")
             lines.append(f"  下一步：{next_action}")
-            lines.append(f"  证据：{evidence}")
 
     lines.extend(["", "## 昨日成果与系统变更", ""])
     if not daily_changes:
@@ -1640,11 +1782,9 @@ def daily_card_markdown(
         for change in daily_changes:
             label = markdown_label(change.get("label") or "系统变更")
             component = markdown_label(change.get("component") or "未知组件")
-            summary = markdown_label(change.get("summary") or "未记录变更概要")
-            evidence = markdown_label(change.get("evidence") or "操作日志")
+            summary = markdown_label(compact_digest_text(change.get("summary") or "未记录变更概要"))
             lines.append(f"- **{label}**：{component}")
             lines.append(f"  结果：{summary}")
-            lines.append(f"  证据：{evidence}")
 
     lines.extend(["", "## 周期任务运行状态", ""])
     recurring_items = recurring_tasks.get("tasks", [])
@@ -1727,52 +1867,8 @@ def daily_card_markdown(
             next_action = markdown_label(task.get("next_action") or "未记录下一步")
             lines.append(f"- **{status}**：{title}（{project_label(task)}）")
             lines.append(f"  下一步：{next_action}")
-    closure_counts = repository_closure.get("counts", {})
-    lines.extend(
-        [
-            "",
-            "## Git / PR 收尾状态",
-            "",
-            "- 进行中 / 证据不足：{in_progress}；待集成：{awaiting_integration}；PR 待处理：{pr_pending}；历史遗留：{legacy}；已合并待清理：{merged_cleanup}。".format(
-                in_progress=closure_counts.get("in_progress", 0),
-                awaiting_integration=closure_counts.get("awaiting_integration", 0),
-                pr_pending=closure_counts.get("pr_pending", 0),
-                legacy=closure_counts.get("legacy", 0),
-                merged_cleanup=closure_counts.get("merged_cleanup", 0),
-            ),
-        ]
-    )
-    closure_findings = repository_closure.get("findings", [])
-    if not closure_findings:
-        lines.append("- 当前扫描范围内未发现待收尾 Git / PR 项；这仍不是对所有历史对话完成状态的证明。")
-    else:
-        blockers = [finding for finding in closure_findings if finding.get("category") == "in_progress"]
-        automatic_candidates = [finding for finding in closure_findings if finding.get("category") != "in_progress"]
-        lines.append(
-            f"- 自动收尾候选：{len(automatic_candidates)} 项；将由本次自动化按动作预算处理，完整事实见仓库报告。"
-        )
-        if blockers:
-            lines.append(f"- 当前真正阻塞候选：{len(blockers)} 项。")
-        for finding in blockers[:5]:
-            repository = markdown_label(finding.get("repository", "未知仓库"))
-            branch = markdown_label(finding.get("branch") or "(detached)")
-            finding_id = markdown_label(finding.get("id", ""))
-            reason = markdown_label(finding.get("reason", "待确认"))
-            lines.append(f"- **真正阻塞候选** `{finding_id}`：{repository} / `{branch}`")
-            lines.append(f"  判断：{reason}")
-        if len(blockers) > 5:
-            lines.append(f"- 另有 {len(blockers) - 5} 个阻塞候选，详见仓库收尾报告。")
-    for warning in repository_closure.get("warnings", [])[:5]:
-        lines.append(f"- 扫描警告：{markdown_label(warning)}")
+    lines.extend(repository_closure_lines(repository_closure, repository_resolutions))
 
-    lines.extend(["", "## 历史成果索引", ""])
-    history_path = work_ledger_root() / "index.md"
-    if recent_work:
-        lines.append(
-            f"- 历史成果账本已有记录；日报不再重复滚动展示旧条目。完整历史见 {path_link(history_path, 'Codex 工作成果账本')}。"
-        )
-    else:
-        lines.append(f"- 历史成果账本尚无可用记录；索引位置：{path_link(history_path, 'Codex 工作成果账本')}。")
     lines.extend(["", "## 前日产物和待确认内容", ""])
     if not actions:
         lines.append("- 当前没有待确认产物。")
@@ -1926,6 +2022,7 @@ def daily_digest(source, *, force=False):
     recurring_report = run_recurring_task_audit()
     follow_ups = enrich_follow_ups(active_follow_ups(), recurring_report)
     closure_report = repository_closure_report(source)
+    repository_resolutions = today_repository_resolutions()
     new_artifacts = artifact_summary_entries()
     artifacts = upsert_pending_artifacts(new_artifacts)
     actions = artifact_actions(artifacts)
@@ -1940,6 +2037,7 @@ def daily_digest(source, *, force=False):
         daily_changes,
         activity_source,
         follow_ups,
+        repository_resolutions,
     )
     saved_digest_path = save_daily_digest(summary)
     monthly_rollup_paths = rollup_completed_months()
@@ -1968,6 +2066,8 @@ def daily_digest(source, *, force=False):
         repository_closure_findings=closure_report.get("findings", []),
         repository_closure_report_path=str(repository_closure_report_path("md")),
         repository_closure_warnings=closure_report.get("warnings", []),
+        repository_resolution_count=len(repository_resolutions),
+        repository_resolutions=repository_resolutions,
         artifact_summary_count=len(artifacts),
         artifact_actions=actions,
         new_artifact_candidate_count=len(new_artifacts),

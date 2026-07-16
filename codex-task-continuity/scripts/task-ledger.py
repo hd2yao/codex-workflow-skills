@@ -55,6 +55,13 @@ FOLLOW_UP_STATUSES = {
 
 ACTIVE_FOLLOW_UP_STATUSES = {"watching", "ready", "needs_attention"}
 RESUME_MODES = {"auto", "notify", "manual"}
+REPOSITORY_RESOLUTION_STATUSES = {
+    "completed",
+    "active_deferred",
+    "failed",
+    "ignored",
+    "planned",
+}
 
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
@@ -131,6 +138,14 @@ def activity_path(path, day):
     return activity_dir(path) / f"{day}.json"
 
 
+def repository_resolution_dir(path):
+    return path / "repository-closure" / "resolutions"
+
+
+def repository_resolution_path(path, day):
+    return repository_resolution_dir(path) / f"{day}.json"
+
+
 def validate_activity_date(value):
     try:
         parsed = dt.date.fromisoformat(str(value))
@@ -138,6 +153,16 @@ def validate_activity_date(value):
         raise ValueError(f"invalid activity date: {value}") from exc
     if parsed.isoformat() != str(value):
         raise ValueError(f"invalid activity date: {value}")
+    return parsed.isoformat()
+
+
+def validate_resolution_date(value):
+    try:
+        parsed = dt.date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(f"invalid resolution date: {value}") from exc
+    if parsed.isoformat() != str(value):
+        raise ValueError(f"invalid resolution date: {value}")
     return parsed.isoformat()
 
 
@@ -189,6 +214,41 @@ def save_activity(path, day, data):
     target_dir.mkdir(parents=True, exist_ok=True)
     target = activity_path(path, day)
     fd, temp_name = tempfile.mkstemp(prefix=f"activity-{day}.", suffix=".json", dir=str(target_dir))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(redact_value(data), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        temp_path.replace(target)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def load_repository_resolutions(path, day):
+    target = repository_resolution_path(path, day)
+    if not target.exists():
+        return {"version": 1, "date": day, "resolutions": {}}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "date": day, "resolutions": {}}
+    if not isinstance(data.get("resolutions"), dict):
+        data["resolutions"] = {}
+    data["version"] = 1
+    data["date"] = day
+    return data
+
+
+def save_repository_resolutions(path, day, data):
+    target_dir = repository_resolution_dir(path)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = repository_resolution_path(path, day)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f"repository-resolution-{day}.",
+        suffix=".json",
+        dir=str(target_dir),
+    )
     temp_path = Path(temp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -537,6 +597,58 @@ def clear_activity(args):
     return {"date": day, "removed_count": removed_count}
 
 
+def record_repository_resolution(args):
+    path = ledger_dir()
+    day = validate_resolution_date(args.date)
+    if args.status not in REPOSITORY_RESOLUTION_STATUSES:
+        raise ValueError(f"unknown repository resolution status: {args.status}")
+    finding_id = redact_text(args.finding_id).strip()
+    now = utc_now()
+    with locked_ledger(path):
+        data = load_repository_resolutions(path, day)
+        existing = data["resolutions"].get(finding_id, {})
+        def updated(field, default=""):
+            value = getattr(args, field)
+            return redact_text(value) if value is not None else existing.get(field, default)
+
+        resolution = {
+            "date": day,
+            "finding_id": finding_id,
+            "repository": redact_text(args.repository),
+            "project_name": updated("project_name"),
+            "branch": updated("branch"),
+            "status": args.status,
+            "stage": updated("stage"),
+            "summary": redact_text(args.summary),
+            "next_action": updated("next_action"),
+            "thread_id": updated("thread_id"),
+            "thread_title": updated("thread_title"),
+            "evidence": updated("evidence"),
+            "created_at": existing.get("created_at") or now,
+            "updated_at": now,
+        }
+        data["resolutions"][finding_id] = resolution
+        save_repository_resolutions(path, day, data)
+    return {"repository_resolution": resolution}
+
+
+def list_repository_resolutions(args):
+    day = validate_resolution_date(args.date)
+    data = load_repository_resolutions(ledger_dir(), day)
+    resolutions = list(data["resolutions"].values())
+    if args.status:
+        statuses = {item.strip() for item in args.status.split(",") if item.strip()}
+        resolutions = [item for item in resolutions if item.get("status") in statuses]
+    resolutions.sort(
+        key=lambda item: (
+            item.get("status") or "",
+            item.get("project_name") or item.get("repository") or "",
+            item.get("branch") or "",
+        )
+    )
+    return {"date": day, "resolutions": resolutions}
+
+
 def candidate_entries(root):
     if not root:
         return []
@@ -733,6 +845,14 @@ def print_result(result, output_format):
         for activity in result["activities"]:
             print(f"{activity['id']} {activity['status']} {activity['title']}")
         return
+    if "repository_resolution" in result:
+        item = result["repository_resolution"]
+        print(f"{item['finding_id']} {item['status']} {item.get('project_name') or item['repository']}")
+        return
+    if "resolutions" in result:
+        for item in result["resolutions"]:
+            print(f"{item['finding_id']} {item['status']} {item.get('project_name') or item['repository']}")
+        return
     if "removed_count" in result:
         print(result["removed_count"])
         return
@@ -847,6 +967,32 @@ def build_parser():
     clear_activity_cmd.add_argument("--date", required=True)
     clear_activity_cmd.add_argument("--format", choices=["text", "json"], default="text")
     clear_activity_cmd.set_defaults(func=clear_activity)
+
+    record_resolution_cmd = subparsers.add_parser("record-repository-resolution")
+    record_resolution_cmd.add_argument("--date", required=True)
+    record_resolution_cmd.add_argument("--finding-id", required=True)
+    record_resolution_cmd.add_argument("--repository", required=True)
+    record_resolution_cmd.add_argument("--project-name")
+    record_resolution_cmd.add_argument("--branch")
+    record_resolution_cmd.add_argument(
+        "--status",
+        choices=sorted(REPOSITORY_RESOLUTION_STATUSES),
+        required=True,
+    )
+    record_resolution_cmd.add_argument("--stage")
+    record_resolution_cmd.add_argument("--summary", required=True)
+    record_resolution_cmd.add_argument("--next-action")
+    record_resolution_cmd.add_argument("--thread-id")
+    record_resolution_cmd.add_argument("--thread-title")
+    record_resolution_cmd.add_argument("--evidence")
+    record_resolution_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    record_resolution_cmd.set_defaults(func=record_repository_resolution)
+
+    list_resolutions_cmd = subparsers.add_parser("list-repository-resolutions")
+    list_resolutions_cmd.add_argument("--date", required=True)
+    list_resolutions_cmd.add_argument("--status", default="")
+    list_resolutions_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    list_resolutions_cmd.set_defaults(func=list_repository_resolutions)
 
     digest_cmd = subparsers.add_parser("digest")
     digest_cmd.add_argument("--date", default="")

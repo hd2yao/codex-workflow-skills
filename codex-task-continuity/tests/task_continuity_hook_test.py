@@ -1,6 +1,7 @@
 import json
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,7 @@ def write_jsonl(path, records):
     )
 
 
-def run_hook(hook_input, ledger_dir, extra_env=None):
+def run_hook(hook_input, ledger_dir, extra_env=None, hook_path=HOOK):
     env = os.environ.copy()
     env["CODEX_TASK_LEDGER_DIR"] = str(ledger_dir)
     env["CODEX_OPERATION_LEDGER_PATH"] = str(Path(ledger_dir) / "operation-ledger" / "events.jsonl")
@@ -38,7 +39,7 @@ def run_hook(hook_input, ledger_dir, extra_env=None):
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        [sys.executable, str(HOOK)],
+        [sys.executable, str(hook_path)],
         input=json.dumps(hook_input, ensure_ascii=False),
         text=True,
         capture_output=True,
@@ -272,8 +273,12 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(1, output["repository_closure_count"])
             self.assertEqual(1, output["repository_closure_counts"]["in_progress"])
             self.assertIn("账本为 0 不代表所有 Codex 任务都已完成", output["systemMessage"])
-            self.assertIn("## Git / PR 收尾状态", output["systemMessage"])
+            self.assertIn("## 仓库收尾", output["systemMessage"])
             self.assertIn("demo", output["systemMessage"])
+            self.assertIn("当前分支 main 有 1 个已跟踪改动", output["systemMessage"])
+            self.assertNotIn("证据不足", output["systemMessage"])
+            self.assertNotIn("RC-", output["systemMessage"])
+            self.assertNotIn("repository-closure", output["systemMessage"])
             self.assertTrue(Path(output["repository_closure_report_path"]).exists())
 
     def test_session_start_reuses_today_repository_closure_report(self):
@@ -329,9 +334,10 @@ class TaskContinuityHookTest(unittest.TestCase):
             output = json.loads(result.stdout)
             self.assertEqual(1, output["repository_closure_count"])
             self.assertEqual([], output["repository_closure_warnings"])
-            self.assertNotIn("feature/ready", output["systemMessage"])
+            self.assertIn("feature/ready", output["systemMessage"])
             self.assertEqual("feature/ready", output["repository_closure_findings"][0]["branch"])
-            self.assertIn("自动收尾候选：1 项", output["systemMessage"])
+            self.assertIn("分支含有尚未进入默认分支的提交", output["systemMessage"])
+            self.assertNotIn("自动收尾候选", output["systemMessage"])
 
     def test_daily_digest_removes_old_persisted_markdown_summaries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -878,7 +884,7 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertIn("A01", second_output["systemMessage"])
             self.assertIn("older-summary.md", second_output["systemMessage"])
 
-    def test_daily_digest_references_completed_work_without_repeating_old_items(self):
+    def test_daily_digest_keeps_completed_work_index_internal(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             ledger_dir = tmp_path / "ledger"
@@ -910,8 +916,8 @@ class TaskContinuityHookTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             output = json.loads(result.stdout)
-            self.assertIn("## 历史成果索引", output["systemMessage"])
-            self.assertIn(str(work_dir / "index.md"), output["systemMessage"])
+            self.assertNotIn("## 历史成果索引", output["systemMessage"])
+            self.assertNotIn(str(work_dir / "index.md"), output["systemMessage"])
             self.assertNotIn("实现每日摘要待确认池", output["systemMessage"])
             self.assertNotIn("每日摘要展示所有未确认产物", output["systemMessage"])
             self.assertEqual(output["recent_completed_work_count"], 1)
@@ -933,10 +939,11 @@ class TaskContinuityHookTest(unittest.TestCase):
                                 "thread_id": "thread-geo",
                                 "title": "调研 GEO 核心模块",
                                 "status": "delivered_pending_trial",
-                                "summary": "可运行 V1 已完成，Demo 已验证",
+                                "summary": "上下文卡片记录的最近进展：可运行 V1 已完成，Demo 已验证；" + "不应展示的长尾" * 30,
                                 "next_action": "连接一个真实平台并试运行",
+                                "project_name": "GEO 智能诊断平台",
                                 "project_path": "/Users/dysania/program/GEO",
-                                "evidence": "构建和浏览器验证通过",
+                                "evidence": "/Users/dysania/.codex/context-cards/private-evidence.md",
                             }
                         },
                     },
@@ -960,8 +967,117 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(1, output["previous_day_activity_count"])
             self.assertIn("## 昨日实际工作与后续", output["systemMessage"])
             self.assertIn("已交付待试用", output["systemMessage"])
-            self.assertIn("调研 GEO 核心模块", output["systemMessage"])
+            self.assertIn("GEO 智能诊断平台", output["systemMessage"])
             self.assertIn("连接一个真实平台并试运行", output["systemMessage"])
+            self.assertNotIn("上下文卡片记录的最近进展", output["systemMessage"])
+            self.assertNotIn("private-evidence", output["systemMessage"])
+            self.assertNotIn("不应展示的长尾不应展示的长尾不应展示的长尾", output["systemMessage"])
+
+    def test_daily_digest_groups_repository_resolutions_without_internal_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            today = dt.date.today().isoformat()
+            for finding_id, project, status, stage, summary, next_action in (
+                ("RC-DONE", "OpenClaw", "completed", "已合并", "PR 已合并并清理 6 条旧分支", "无需操作"),
+                ("RC-ACTIVE", "YA FundMind", "active_deferred", "近期仍在开发", "Web Console 分支今天仍在实现", "原任务完成后自动合并"),
+                ("RC-FAILED", "旧商城", "failed", "合并测试", "测试失败在订单模块", "对应任务继续修复失败测试"),
+            ):
+                recorded = run_ledger(
+                    [
+                        "record-repository-resolution",
+                        "--date",
+                        today,
+                        "--finding-id",
+                        finding_id,
+                        "--repository",
+                        project,
+                        "--project-name",
+                        project,
+                        "--branch",
+                        "feature/example",
+                        "--status",
+                        status,
+                        "--stage",
+                        stage,
+                        "--summary",
+                        summary,
+                        "--next-action",
+                        next_action,
+                        "--evidence",
+                        "/internal/closure-report.json",
+                        "--format",
+                        "json",
+                    ],
+                    ledger_dir,
+                )
+                self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(tmp_path / "program"),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(tmp_path / "program-governance"),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            message = json.loads(result.stdout)["systemMessage"]
+            self.assertIn("今日已处理", message)
+            self.assertIn("近期开发暂不合并", message)
+            self.assertIn("需要关注", message)
+            self.assertIn("PR 已合并并清理 6 条旧分支", message)
+            self.assertIn("Web Console 分支今天仍在实现", message)
+            self.assertIn("测试失败在订单模块", message)
+            self.assertNotIn("/internal/closure-report.json", message)
+            self.assertNotIn("RC-DONE", message)
+
+    def test_installed_hook_uses_skill_companion_scripts_instead_of_stale_hook_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            hooks_dir = tmp_path / "hooks"
+            hooks_dir.mkdir()
+            installed_hook = hooks_dir / "task-continuity-hook.py"
+            shutil.copy2(HOOK, installed_hook)
+            recorded = run_ledger(
+                [
+                    "record-repository-resolution",
+                    "--date",
+                    dt.date.today().isoformat(),
+                    "--finding-id",
+                    "RC-INSTALLED",
+                    "--repository",
+                    "example/repo",
+                    "--project-name",
+                    "安装副本测试",
+                    "--status",
+                    "completed",
+                    "--summary",
+                    "已处理",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            self.assertEqual(0, recorded.returncode, recorded.stderr)
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_TASK_CONTINUITY_SKILL_DIR": str(ROOT),
+                    "CODEX_PROGRAM_ROOT": str(tmp_path / "program"),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(tmp_path / "program-governance"),
+                },
+                hook_path=installed_hook,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(1, output["repository_resolution_count"])
+            self.assertIn("安装副本测试", output["systemMessage"])
 
     def test_daily_digest_falls_back_to_operation_ledger_and_hides_stale_work_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,7 +1159,7 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual("operation_ledger_fallback", output["previous_day_activity_source"])
             self.assertEqual(1, output["previous_day_activity_count"])
             self.assertEqual(2, output["previous_day_change_count"])
-            self.assertIn("操作日志降级证据", output["systemMessage"])
+            self.assertIn("活动记录使用操作日志补全", output["systemMessage"])
             self.assertIn("更新 GEO 核心模块", output["systemMessage"])
             self.assertIn("GEO API 与浏览器验收通过", output["systemMessage"])
             self.assertIn("## 昨日成果与系统变更", output["systemMessage"])

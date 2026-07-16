@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_ROOT = Path("/Users/dysania/program")
 DEFAULT_OUTPUT_DIR = Path.home() / ".codex" / "task-ledger" / "repository-closure"
+DEFAULT_IGNORE_PATH = DEFAULT_OUTPUT_DIR / "ignore.json"
 EXCLUDED_DIRS = {
     ".git",
     ".hg",
@@ -31,12 +32,47 @@ EXCLUDED_DIRS = {
     "vendor",
 }
 CATEGORY_LABELS = {
-    "in_progress": "进行中 / 证据不足",
+    "in_progress": "有未提交改动",
     "awaiting_integration": "待集成",
     "pr_pending": "PR 待处理",
     "legacy": "历史遗留",
     "merged_cleanup": "已合并待清理",
 }
+
+
+def load_ignore_rules(path=DEFAULT_IGNORE_PATH):
+    """读取持久忽略规则；文件缺失或格式损坏时按空规则处理。"""
+    target = Path(path).expanduser()
+    if not target.exists():
+        return []
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    repositories = data.get("repositories", []) if isinstance(data, dict) else []
+    return [item for item in repositories if isinstance(item, dict) and item.get("path")]
+
+
+def ignored_worktree(path, rules):
+    """返回匹配的忽略规则；默认只匹配仓库根路径。"""
+    try:
+        candidate = Path(path).expanduser().resolve()
+    except OSError:
+        candidate = Path(path).expanduser()
+    for rule in rules:
+        try:
+            ignored = Path(rule["path"]).expanduser().resolve()
+        except OSError:
+            ignored = Path(rule["path"]).expanduser()
+        if candidate == ignored:
+            return rule
+        if rule.get("include_worktrees"):
+            try:
+                candidate.relative_to(ignored)
+                return rule
+            except ValueError:
+                pass
+    return None
 
 
 def _run(args, *, cwd=None, timeout=20, check=True):
@@ -286,6 +322,26 @@ def _branch_rows(worktree, base_ref):
     return rows
 
 
+def _working_tree_updated_at(worktree, status_lines):
+    paths = []
+    for line in status_lines:
+        raw = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in raw:
+            raw = raw.rsplit(" -> ", 1)[-1]
+        raw = raw.strip('"')
+        if raw:
+            paths.append(Path(worktree) / raw)
+    timestamps = []
+    for path in paths:
+        try:
+            timestamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not timestamps:
+        return None
+    return dt.datetime.fromtimestamp(max(timestamps)).astimezone().isoformat(timespec="seconds")
+
+
 def inspect_worktree(path, *, gh_client=None, today=None):
     """读取一个 worktree 的 Git/PR 元数据，不读取工作文件内容。"""
     worktree = Path(path).expanduser().resolve()
@@ -332,6 +388,14 @@ def inspect_worktree(path, *, gh_client=None, today=None):
         except Exception as exc:  # 审计失败不得阻塞主流程
             warnings.append(f"{worktree}: GitHub PR 元数据读取失败：{exc}")
 
+    head_committed_at = _git(
+        worktree,
+        "log",
+        "-1",
+        "--format=%cI",
+        check=False,
+    ).stdout.strip() or None
+
     return {
         "worktree": str(worktree),
         "top_level": str(top_level),
@@ -360,6 +424,8 @@ def inspect_worktree(path, *, gh_client=None, today=None):
         "pull_requests": pull_requests,
         "warnings": warnings,
         "inspected_on": (today or dt.date.today()).isoformat(),
+        "head_committed_at": head_committed_at,
+        "working_tree_updated_at": _working_tree_updated_at(worktree, status_lines),
     }
 
 
@@ -387,6 +453,56 @@ def _finding_category(category, updated_at, today, recent_days):
     if category != "merged_cleanup" and _is_legacy(updated_at, today, recent_days):
         return "legacy", category
     return category, None
+
+
+def _age_days(value, today):
+    updated = _parse_date(value)
+    if updated is None:
+        return None
+    return max(0, (today - updated).days)
+
+
+def _decision_metadata(finding, today, recent_days):
+    last_activity_at = (
+        finding.get("last_activity_at")
+        or finding.get("working_tree_updated_at")
+        or finding.get("updated_at")
+    )
+    age_days = _age_days(last_activity_at, today)
+    stale = age_days is not None and age_days > recent_days
+    category = finding.get("category")
+    stage = finding.get("workflow_stage")
+    if not stage:
+        stage = {
+            "in_progress": "uncommitted_changes",
+            "awaiting_integration": "committed_not_merged",
+            "pr_pending": "pr_not_merged",
+            "legacy": "stale_branch",
+            "merged_cleanup": "merged_cleanup",
+        }.get(category, "repository_review")
+    if category == "merged_cleanup":
+        disposition = "auto_cleanup"
+        next_action = "分支已进入默认分支，按仓库级动作预算清理 worktree 和旧分支。"
+    elif stale or category == "legacy":
+        disposition = "auto_finish"
+        next_action = (
+            f"最近活动已超过 {recent_days} 天，优先交给对应任务完成测试、推送、合并和清理；"
+            "遇到冲突或测试失败时记录准确失败步骤。"
+        )
+    else:
+        disposition = "active_deferred"
+        next_action = "近期仍有活动，保留当前分支；对应任务完成后自动推送、合并并清理。"
+    finding.update(
+        {
+            "workflow_stage": stage,
+            "last_activity_at": last_activity_at,
+            "age_days": age_days,
+            "stale": stale,
+            "disposition": disposition,
+            "next_action": finding.get("next_action") or next_action,
+        }
+    )
+    return finding
 
 
 def classify_findings(worktrees, *, recent_days=30, today=None):
@@ -440,6 +556,14 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
 
         if repo.get("dirty"):
             finding_id = _stable_id("dirty", common_dir, current_branch, repo["worktree"])
+            tracked = repo.get("tracked_change_count", 0)
+            untracked = repo.get("untracked_count", 0)
+            branch_label = current_branch or "detached HEAD"
+            change_parts = []
+            if tracked:
+                change_parts.append(f"{tracked} 个已跟踪改动")
+            if untracked:
+                change_parts.append(f"{untracked} 个未跟踪文件")
             findings[finding_id] = {
                 "id": finding_id,
                 "category": "in_progress",
@@ -448,8 +572,8 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 "worktree": repo["worktree"],
                 "branch": current_branch,
                 "detached": repo.get("detached", False),
-                "tracked_change_count": repo.get("tracked_change_count", 0),
-                "untracked_count": repo.get("untracked_count", 0),
+                "tracked_change_count": tracked,
+                "untracked_count": untracked,
                 "ahead_count": repo.get("ahead_count", 0),
                 "behind_count": repo.get("behind_count", 0),
                 "default_comparison_ref": repo.get("default_comparison_ref"),
@@ -459,9 +583,12 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 "upstream_ahead_count": repo.get("upstream_ahead_count", 0),
                 "upstream_behind_count": repo.get("upstream_behind_count", 0),
                 "pr": prs_by_branch.get(current_branch),
-                "reason": "工作区存在尚未提交的改动，任务完成证据不足",
+                "reason": f"当前分支 {branch_label} 有 {'、'.join(change_parts) or '未提交改动'}，尚未进入提交与合并阶段。",
                 "suggested_action": "resolve_dirty_worktree",
-                "updated_at": repo.get("inspected_on"),
+                "workflow_stage": "uncommitted_changes",
+                "working_tree_updated_at": repo.get("working_tree_updated_at"),
+                "last_activity_at": repo.get("working_tree_updated_at") or repo.get("head_committed_at"),
+                "updated_at": repo.get("working_tree_updated_at") or repo.get("head_committed_at"),
             }
 
         for branch_row in repo.get("local_branches", []):
@@ -512,7 +639,7 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
                 "reason": {
                     "awaiting_integration": "分支含有尚未进入默认分支的提交",
                     "pr_pending": "分支已有开放 PR，尚未完成合并",
-                    "legacy": "分支或 PR 超过近期窗口，需人工确认是否仍有效",
+                    "legacy": f"分支最近活动超过 {recent_days} 天，且仍有提交未进入默认分支",
                     "merged_cleanup": "分支已进入默认分支，但 worktree 尚未清理",
                 }[category],
                 "suggested_action": {
@@ -557,7 +684,7 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
             }
 
     ordered = sorted(
-        findings.values(),
+        (_decision_metadata(item, today, recent_days) for item in findings.values()),
         key=lambda item: (
             list(CATEGORY_LABELS).index(item["category"]),
             item["repository"].lower(),
@@ -569,7 +696,7 @@ def classify_findings(worktrees, *, recent_days=30, today=None):
     for finding in ordered:
         counts[finding["category"]] += 1
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": dt.datetime.now().astimezone().replace(
             year=today.year,
             month=today.month,
@@ -592,7 +719,7 @@ def render_markdown(report):
         f"- 生成时间：{report['generated_at']}",
         f"- 扫描 checkout：{report['repository_count']}",
         f"- 发现项：{report['finding_count']}",
-        f"- 进行中 / 证据不足：{counts['in_progress']}",
+        f"- 有未提交改动：{counts['in_progress']}",
         f"- 待集成：{counts['awaiting_integration']}",
         f"- PR 待处理：{counts['pr_pending']}",
         f"- 历史遗留：{counts['legacy']}",
@@ -653,7 +780,13 @@ def main(argv=None):
     )
     parser.add_argument("--include-github", action="store_true", help="通过 gh 读取开放 PR 元数据。")
     parser.add_argument("--refresh-remotes", action="store_true", help="扫描前对 origin 执行 fetch --prune。")
-    parser.add_argument("--recent-days", type=int, default=30, help="超过该天数的发现归为历史遗留。")
+    parser.add_argument("--recent-days", type=int, default=15, help="超过该天数的发现优先自动收尾。")
+    parser.add_argument(
+        "--ignore-file",
+        type=Path,
+        default=None,
+        help="持久忽略的仓库列表。",
+    )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--no-write", action="store_true", help="只输出，不更新 latest 报告。")
@@ -664,11 +797,14 @@ def main(argv=None):
         configured = os.environ.get("CODEX_REPOSITORY_SCAN_ROOTS")
         roots = configured.split(os.pathsep) if configured else [str(DEFAULT_ROOT)]
     discovered = discover_git_worktrees(roots)
+    ignore_rules = load_ignore_rules(args.ignore_file or args.output_dir / "ignore.json")
     gh_client = cached_github_client() if args.include_github else None
     inspected = []
     warnings = []
     refreshed_common_dirs = set()
     for worktree in discovered:
+        if ignored_worktree(worktree, ignore_rules):
+            continue
         try:
             common_dir = _resolve_git_path(
                 worktree,

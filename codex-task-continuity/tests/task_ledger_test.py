@@ -36,6 +36,88 @@ def fake_github_token():
 
 
 class TaskLedgerTest(unittest.TestCase):
+    def test_repository_resolution_upserts_and_lists_by_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "record-repository-resolution",
+                "--date",
+                "2026-07-16",
+                "--finding-id",
+                "RC-EXAMPLE001",
+                "--repository",
+                "hd2yao/example",
+                "--project-name",
+                "示例项目",
+                "--branch",
+                "feature/demo",
+                "--status",
+                "active_deferred",
+                "--stage",
+                "功能仍在开发",
+                "--summary",
+                "对应任务今天仍在实现 API",
+                "--next-action",
+                "任务完成后自动创建 PR 并合并",
+                "--thread-id",
+                "thread-example",
+                "--thread-title",
+                "实现示例 API",
+                "--evidence",
+                "/internal/report.json",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-4],
+                    "--summary",
+                    "API 和测试仍在同一任务中推进",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            listed = run_ledger(
+                ["list-repository-resolutions", "--date", "2026-07-16", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            resolutions = load_json(listed.stdout)["resolutions"]
+            self.assertEqual(1, len(resolutions))
+            self.assertEqual("active_deferred", resolutions[0]["status"])
+            self.assertIn("仍在同一任务", resolutions[0]["summary"])
+            self.assertEqual("/internal/report.json", resolutions[0]["evidence"])
+
+    def test_repository_resolution_date_cannot_escape_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_ledger(
+                [
+                    "record-repository-resolution",
+                    "--date",
+                    "../escape",
+                    "--finding-id",
+                    "RC-1",
+                    "--repository",
+                    "example",
+                    "--status",
+                    "failed",
+                    "--summary",
+                    "失败",
+                    "--format",
+                    "json",
+                ],
+                Path(tmp) / "ledger",
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("invalid resolution date", result.stderr)
+
     def test_track_follow_up_upserts_by_thread_and_can_update_check_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"
