@@ -1097,6 +1097,193 @@ print(json.dumps({
             self.assertIn("2026-07-14 按计划成功", output["systemMessage"])
             self.assertIn("数据质量：normal", output["systemMessage"])
 
+    def test_daily_digest_links_follow_up_monitor_recurring_task_and_parallel_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            scanner = tmp_path / "recurring-scanner.py"
+            scanner.write_text(
+                """#!/usr/bin/env python3
+import json
+print(json.dumps({
+    'schema_version': 1,
+    'counts': {'success': 1, 'overdue': 0, 'failed': 0, 'unknown': 0},
+    'tasks': [{
+        'id': 'ya-fundmind-daily',
+        'project': 'YA FundMind',
+        'name': '每日投研运行',
+        'status': 'success',
+        'reason': '最近一次 scheduler run 成功',
+        'next_expected_at': '2099-07-16T21:30:00+08:00'
+    }],
+    'warnings': []
+}, ensure_ascii=False))
+""",
+                encoding="utf-8",
+            )
+            automations_dir = tmp_path / "automations"
+            automation_dir = automations_dir / "ya-fundmind-v2-rc-final"
+            automation_dir.mkdir(parents=True)
+            automation_dir.joinpath("automation.toml").write_text(
+                'version = 1\nid = "ya-fundmind-v2-rc-final"\nkind = "heartbeat"\n'
+                'name = "YA FundMind V2 RC 观察"\nstatus = "ACTIVE"\n'
+                'target_thread_id = "thread-ya-fundmind"\n',
+                encoding="utf-8",
+            )
+            tracked = run_ledger(
+                [
+                    "track-follow-up",
+                    "--thread-id",
+                    "thread-ya-fundmind",
+                    "--title",
+                    "YA FundMind V2 Final 观察与并行前端轨道",
+                    "--goal",
+                    "完成 3 次 post-RC 真实运行并发布 v2.0.0",
+                    "--wait-condition",
+                    "等待每日 21:30 scheduler run，当前 1/3",
+                    "--resume-mode",
+                    "auto",
+                    "--resume-action",
+                    "达到 3/3 后继续 Final 发布",
+                    "--parallel-action",
+                    "在隔离 worktree 继续 Web Console",
+                    "--monitor-automation-id",
+                    "ya-fundmind-v2-rc-final",
+                    "--monitor-schedule",
+                    "每天 22:15",
+                    "--next-check-at",
+                    "2099-07-16T22:15:00+08:00",
+                    "--recurring-task-id",
+                    "ya-fundmind-daily",
+                    "--project-name",
+                    "YA FundMind",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            self.assertEqual(tracked.returncode, 0, tracked.stderr)
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_AUTOMATIONS_DIR": str(automations_dir),
+                    "CODEX_RECURRING_TASK_SCANNER": str(scanner),
+                    "CODEX_PROGRAM_ROOT": str(tmp_path / "program"),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(tmp_path / "program-governance"),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(1, output["follow_up_count"])
+            self.assertEqual(0, output["follow_up_attention_count"])
+            self.assertIn("## 等待条件与续作监控", output["systemMessage"])
+            self.assertIn("自动监控中", output["systemMessage"])
+            self.assertIn("当前 1/3", output["systemMessage"])
+            self.assertIn("每天 22:15", output["systemMessage"])
+            self.assertIn("达到 3/3 后继续 Final 发布", output["systemMessage"])
+            self.assertIn("在隔离 worktree 继续 Web Console", output["systemMessage"])
+            self.assertIn("每日投研运行：success", output["systemMessage"])
+            self.assertIn("用户操作：无需", output["systemMessage"])
+
+    def test_daily_digest_reports_inactive_and_overdue_follow_up_monitors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            automations_dir = tmp_path / "automations"
+            automation_dir = automations_dir / "paused-monitor"
+            automation_dir.mkdir(parents=True)
+            automation_dir.joinpath("automation.toml").write_text(
+                'version = 1\nid = "paused-monitor"\nkind = "heartbeat"\n'
+                'name = "暂停监控"\nstatus = "PAUSED"\n'
+                'target_thread_id = "thread-paused"\n',
+                encoding="utf-8",
+            )
+            incomplete_automation_dir = automations_dir / "incomplete-monitor"
+            incomplete_automation_dir.mkdir(parents=True)
+            incomplete_automation_dir.joinpath("automation.toml").write_text(
+                'version = 1\nid = "incomplete-monitor"\nkind = "heartbeat"\n'
+                'name = "配置不完整监控"\nstatus = "ACTIVE"\n'
+                'target_thread_id = "thread-incomplete"\n',
+                encoding="utf-8",
+            )
+            for thread_id, title, automation_id, next_check in (
+                ("thread-paused", "停用监控目标", "paused-monitor", "2099-07-16T22:15:00+08:00"),
+                ("thread-overdue", "逾期监控目标", "missing-monitor", "2020-07-16T22:15:00+08:00"),
+            ):
+                tracked = run_ledger(
+                    [
+                        "track-follow-up",
+                        "--thread-id",
+                        thread_id,
+                        "--title",
+                        title,
+                        "--goal",
+                        "等待后继续",
+                        "--wait-condition",
+                        "等待外部条件",
+                        "--resume-mode",
+                        "auto",
+                        "--resume-action",
+                        "自动恢复",
+                        "--monitor-automation-id",
+                        automation_id,
+                        "--next-check-at",
+                        next_check,
+                        "--format",
+                        "json",
+                    ],
+                    ledger_dir,
+                )
+                self.assertEqual(tracked.returncode, 0, tracked.stderr)
+            incomplete = run_ledger(
+                [
+                    "track-follow-up",
+                    "--thread-id",
+                    "thread-incomplete",
+                    "--title",
+                    "缺少检查点与周期任务目标",
+                    "--goal",
+                    "等待后继续",
+                    "--wait-condition",
+                    "等待外部条件",
+                    "--resume-mode",
+                    "auto",
+                    "--resume-action",
+                    "自动恢复",
+                    "--monitor-automation-id",
+                    "incomplete-monitor",
+                    "--recurring-task-id",
+                    "missing-recurring-task",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            self.assertEqual(incomplete.returncode, 0, incomplete.stderr)
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_AUTOMATIONS_DIR": str(automations_dir),
+                    "CODEX_PROGRAM_ROOT": str(tmp_path / "program"),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(tmp_path / "program-governance"),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(3, output["follow_up_attention_count"])
+            self.assertIn("监控 Automation 未处于 ACTIVE", output["systemMessage"])
+            self.assertIn("监控 Automation 不存在", output["systemMessage"])
+            self.assertIn("下次检查已逾期", output["systemMessage"])
+            self.assertIn("未登记下次检查时间", output["systemMessage"])
+            self.assertIn("关联周期任务未找到", output["systemMessage"])
+            self.assertIn("用户操作：需要处理监控", output["systemMessage"])
+
     def test_daily_digest_rolls_completed_week_and_removes_daily_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"

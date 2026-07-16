@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import datetime as dt
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -93,6 +94,10 @@ def operation_ledger_path():
     return Path(
         os.environ.get("CODEX_OPERATION_LEDGER_PATH", "~/.codex/operation-ledger/events.jsonl")
     ).expanduser()
+
+
+def automations_root():
+    return Path(os.environ.get("CODEX_AUTOMATIONS_DIR", "~/.codex/automations")).expanduser()
 
 
 def local_timezone():
@@ -382,6 +387,13 @@ def active_tasks(limit=8):
     return result.get("tasks", [])[:limit]
 
 
+def active_follow_ups(limit=20):
+    result = ledger_command(
+        ["list-follow-ups", "--status", "watching,ready,needs_attention", "--format", "json"]
+    )
+    return result.get("follow_ups", [])[:limit]
+
+
 def parse_operation_time(value):
     if not value:
         return None
@@ -392,6 +404,97 @@ def parse_operation_time(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed
+
+
+def automation_config(automation_id):
+    if not automation_id or not re.fullmatch(r"[A-Za-z0-9._-]+", str(automation_id)):
+        return None
+    path = automations_root() / str(automation_id) / "automation.toml"
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(config, dict) or config.get("id") != automation_id:
+        return None
+    return config
+
+
+def enrich_follow_ups(follow_ups, recurring_report):
+    recurring_by_id = {
+        item.get("id"): item
+        for item in recurring_report.get("tasks", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    now = dt.datetime.now(local_timezone())
+    enriched = []
+    for source in follow_ups:
+        item = dict(source)
+        monitor = dict(item.get("monitor") or {})
+        item["monitor"] = monitor
+        reasons = []
+        automation_id = monitor.get("automation_id") or ""
+        config = automation_config(automation_id) if automation_id else None
+        automation_status = config.get("status") if config else ""
+        item["automation_status"] = automation_status
+
+        resume_mode = item.get("resume_mode") or "auto"
+        if resume_mode in {"auto", "notify"}:
+            if not item.get("next_check_at"):
+                reasons.append("未登记下次检查时间")
+            if not automation_id:
+                reasons.append("未登记监控 Automation")
+            elif config is None:
+                reasons.append("监控 Automation 不存在")
+            else:
+                if automation_status != "ACTIVE":
+                    reasons.append("监控 Automation 未处于 ACTIVE")
+                target_thread_id = config.get("target_thread_id") or ""
+                expected_thread_id = monitor.get("target_thread_id") or item.get("thread_id") or ""
+                if expected_thread_id and target_thread_id != expected_thread_id:
+                    reasons.append("监控 Automation 投递线程不匹配")
+
+        next_check = parse_operation_time(item.get("next_check_at"))
+        last_checked = parse_operation_time(item.get("last_checked_at"))
+        if next_check is not None and next_check.astimezone(local_timezone()) < now:
+            if last_checked is None or last_checked < next_check:
+                reasons.append("下次检查已逾期且未回写")
+
+        recurring_task_id = item.get("recurring_task_id") or ""
+        recurring = recurring_by_id.get(recurring_task_id)
+        if recurring:
+            item["recurring_task"] = recurring
+            if recurring.get("status") in {"failed", "overdue"}:
+                reasons.append(f"关联周期任务状态为 {recurring.get('status')}")
+        elif recurring_task_id:
+            reasons.append("关联周期任务未找到")
+
+        if item.get("status") == "needs_attention":
+            reasons.append("续作记录已标记需要处理")
+
+        item["monitor_reasons"] = list(dict.fromkeys(reasons))
+        if reasons:
+            item["monitor_state"] = "attention"
+            item["monitor_label"] = "需要处理"
+            item["user_action"] = "需要处理监控：" + "；".join(item["monitor_reasons"])
+        elif item.get("status") == "ready":
+            item["monitor_state"] = "ready"
+            item["monitor_label"] = "条件已满足，待续作"
+            item["user_action"] = "无需；自动续作会在绑定任务中继续，或由日报提示人工恢复。"
+        elif resume_mode == "auto":
+            item["monitor_state"] = "watching"
+            item["monitor_label"] = "自动监控中"
+            item["user_action"] = "无需；监控 Automation 会在条件检查后恢复原任务。"
+        elif resume_mode == "notify":
+            item["monitor_state"] = "watching"
+            item["monitor_label"] = "监控后通知"
+            item["user_action"] = "条件变化后查看通知并决定是否恢复。"
+        else:
+            item["monitor_state"] = "manual"
+            item["monitor_label"] = "等待人工恢复"
+            item["user_action"] = "条件满足后需要手动恢复原任务。"
+        enriched.append(item)
+    return enriched
 
 
 def operation_event_score(event):
@@ -1482,12 +1585,14 @@ def daily_card_markdown(
     recurring_tasks=None,
     daily_changes=None,
     activity_source="activity_ledger",
+    follow_ups=None,
 ):
     recent_work = recent_work or []
     repository_closure = repository_closure or empty_repository_closure_report()
     previous_activity = previous_activity or []
     recurring_tasks = recurring_tasks or empty_recurring_task_report()
     daily_changes = daily_changes or []
+    follow_ups = follow_ups or []
     actions = artifact_actions(artifacts)
     lines = [
         "## Codex 每日任务摘要",
@@ -1497,6 +1602,7 @@ def daily_card_markdown(
         f"**昨日实际任务**：{len(previous_activity)}  ",
         f"**昨日已核实系统变更**：{len(daily_changes)}  ",
         f"**周期任务**：{recurring_tasks.get('task_count', len(recurring_tasks.get('tasks', [])))}  ",
+        f"**续作监控**：{len(follow_ups)}  ",
         f"**Git / PR 待收尾**：{repository_closure.get('finding_count', 0)}  ",
         f"**产物待确认**：{len(actions)}",
         "",
@@ -1571,6 +1677,41 @@ def daily_card_markdown(
             lines.append(f"  下次计划：{next_expected}")
     for warning in recurring_tasks.get("warnings", [])[:5]:
         lines.append(f"- 扫描警告：{markdown_label(warning)}")
+
+    lines.extend(["", "## 等待条件与续作监控", ""])
+    if not follow_ups:
+        lines.append("- 当前没有登记等待外部条件的续作目标。")
+    else:
+        for item in follow_ups:
+            label = markdown_label(item.get("monitor_label") or "续作监控")
+            title = markdown_label(item.get("title") or "未命名目标")
+            goal = markdown_label(item.get("goal") or "未记录目标")
+            wait_condition = markdown_label(item.get("wait_condition") or "未记录等待条件")
+            resume_action = markdown_label(item.get("resume_action") or "未记录恢复动作")
+            parallel_action = markdown_label(item.get("parallel_action") or "暂无安全并行工作")
+            monitor = item.get("monitor") or {}
+            automation_id = markdown_label(monitor.get("automation_id") or "未登记")
+            automation_status = markdown_label(item.get("automation_status") or "未知")
+            monitor_schedule = markdown_label(monitor.get("schedule") or "未记录计划")
+            next_check_at = markdown_label(item.get("next_check_at") or "未记录")
+            lines.append(f"- **{label}**：{title}")
+            lines.append(f"  当前目标：{goal}")
+            lines.append(f"  等待条件：{wait_condition}")
+            lines.append(
+                f"  监控：{automation_id}（{automation_status}；{monitor_schedule}；下次检查 {next_check_at}）"
+            )
+            recurring = item.get("recurring_task")
+            if recurring:
+                recurring_name = markdown_label(recurring.get("name") or item.get("recurring_task_id"))
+                recurring_status = markdown_label(recurring.get("status") or "unknown")
+                recurring_reason = markdown_label(recurring.get("reason") or "未记录判断")
+                lines.append(f"  关联周期任务：{recurring_name}：{recurring_status}（{recurring_reason}）")
+            if item.get("monitor_reasons"):
+                reasons = "；".join(markdown_label(reason) for reason in item["monitor_reasons"])
+                lines.append(f"  监控异常：{reasons}")
+            lines.append(f"  条件满足后：{resume_action}")
+            lines.append(f"  并行工作：{parallel_action}")
+            lines.append(f"  用户操作：{markdown_label(item.get('user_action') or '未记录')}")
 
     lines.extend([
         "",
@@ -1783,6 +1924,7 @@ def daily_digest(source, *, force=False):
     daily_changes = previous_day_operation_changes(operation_events)
     recent_work = recent_completed_work()
     recurring_report = run_recurring_task_audit()
+    follow_ups = enrich_follow_ups(active_follow_ups(), recurring_report)
     closure_report = repository_closure_report(source)
     new_artifacts = artifact_summary_entries()
     artifacts = upsert_pending_artifacts(new_artifacts)
@@ -1797,6 +1939,7 @@ def daily_digest(source, *, force=False):
         recurring_report,
         daily_changes,
         activity_source,
+        follow_ups,
     )
     saved_digest_path = save_daily_digest(summary)
     monthly_rollup_paths = rollup_completed_months()
@@ -1815,6 +1958,11 @@ def daily_digest(source, *, force=False):
         recurring_task_counts=recurring_report.get("counts", {}),
         recurring_tasks=recurring_report.get("tasks", []),
         recurring_task_warnings=recurring_report.get("warnings", []),
+        follow_up_count=len(follow_ups),
+        follow_up_attention_count=sum(
+            1 for item in follow_ups if item.get("monitor_state") == "attention"
+        ),
+        follow_ups=follow_ups,
         repository_closure_count=closure_report.get("finding_count", 0),
         repository_closure_counts=closure_report.get("counts", {}),
         repository_closure_findings=closure_report.get("findings", []),

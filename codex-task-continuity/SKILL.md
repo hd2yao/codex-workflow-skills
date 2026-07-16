@@ -1,13 +1,13 @@
 ---
 name: codex-task-continuity
-description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作、管理待做或等待确认事项、查看已完成成果、生成每日摘要、检查项目周期任务是否正常运行，或需要检查本地仓库中未提交改动、未合并分支、worktree 与 PR 收尾状态时使用。
+description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作、管理待做或等待确认事项、目标因外部条件暂停后的监控与续作、查看已完成成果、生成每日摘要、检查项目周期任务是否正常运行，或需要检查本地仓库中未提交改动、未合并分支、worktree 与 PR 收尾状态时使用。
 ---
 
 # Codex 任务连续性
 
 ## 概要
 
-本技能用于维护跨对话、跨 Agent、跨天的任务连续性。它管理未完成任务、未归属待确认产物、已完成工作索引，以及本地 Git / PR 的待收尾事实；不负责自动续写未完成代码、生成上下文压缩摘要或完整整理 Obsidian 知识库。
+本技能用于维护跨对话、跨 Agent、跨天的任务连续性。它管理未完成任务、外部条件等待后的监控与续作、未归属待确认产物、已完成工作索引，以及本地 Git / PR 的待收尾事实；不负责无证据地推断条件满足、生成上下文压缩摘要或完整整理 Obsidian 知识库。
 
 默认任务账本位置：
 
@@ -59,6 +59,7 @@ scripts/repository-action-budget.py
 - 用户问“我还有哪些任务”“昨天做到哪了”“哪些任务等我确认”。
 - 用户问“之前实现过什么”“这个功能做到哪一步”“有哪些技能已经做完”。
 - 用户说“这个放到待做”“先暂放”“这个不要了”“明天继续”。
+- 目标需要等待定时任务、CI、审批、额度恢复或其他外部状态，并要求条件满足后自动继续或提醒恢复。
 - 用户问“哪些分支还没合并”“有没有代码没提交”“这些任务真的都完成了吗”。
 - 需要把 `needs-review`、`trash-candidates`、artifact manifest 中未归属、未沉淀、可能是一时实验的遗留产物转成后续处理任务。
 - 需要把已完成或阶段完成的功能、技能、Hook、自动化记录成可检索清单。
@@ -92,6 +93,9 @@ python3 scripts/task-ledger.py update task_id --status done
 python3 scripts/task-ledger.py digest --date YYYY-MM-DD
 python3 scripts/task-ledger.py record-activity --date YYYY-MM-DD --thread-id THREAD_ID --title "任务标题" --status delivered_pending_trial --summary "交付结果" --next-action "真实试用"
 python3 scripts/task-ledger.py list-activity --date YYYY-MM-DD
+python3 scripts/task-ledger.py track-follow-up --thread-id THREAD_ID --title "目标" --goal "最终目标" --wait-condition "等待条件" --resume-mode auto --resume-action "条件满足后的动作" --monitor-automation-id AUTOMATION_ID --next-check-at ISO_TIME
+python3 scripts/task-ledger.py update-follow-up FOLLOW_UP_ID --last-checked-at ISO_TIME --next-check-at ISO_TIME
+python3 scripts/task-ledger.py list-follow-ups --status watching,ready,needs_attention
 python3 scripts/task-ledger.py import-curator --needs-review-dir PATH --trash-candidates-dir PATH
 python3 scripts/task-ledger.py import-artifacts --manifest PATH
 python3 scripts/work-ledger.py add --title "完成事项" --summary "做了什么"
@@ -115,6 +119,7 @@ python3 scripts/repository-action-budget.py show
 - `Stop`：只提取显式标记的任务，例如 `TODO:`、`待办：`、`等待确认：`、`阻塞：`、`想法：`。
 - `SessionStart`：每天最多打印一次当前未完成任务摘要，作为定时自动化的兜底；若当天已有仓库收尾报告则直接复用，避免重复网络读取。
 - `DailyDigest`：生成当日任务摘要并打印，供 Codex 定时自动化调用；先执行只读仓库收尾审计，再把 Program manifest、当前 `needs-review` 和 `trash-candidates` 中真正未归属的内容导入待确认产物池。输出使用 Markdown 卡片，产物包含稳定编号、内容概要、路径、选择原因和可回复操作短语。
+- `DailyDigest` 同时读取 active follow-up，校验绑定 Automation 是否存在、ACTIVE、投递到原线程且按时回写，并展示等待条件、恢复动作、关联周期任务和安全并行工作。
 - 每日自动化在调用 `DailyDigest` 前，必须使用 `list_threads` / `read_thread` 读取前一自然日实际活跃任务，并通过 `record-activity` 写入精简活动记录；Hook 不保存完整 transcript。
 - 如果线程索引超时或读取失败，Hook 使用操作日志中的昨日项目/任务活跃事件作为降级证据，并从关联上下文卡片提取最近的助手进展；它仍明确标为“仅确认活跃、未推断完成”，不能退化成空白日报或把进展伪装成完成结论。
 - `PreCompact`：打印当前未完成任务摘要，供压缩上下文保留。
@@ -138,6 +143,9 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - “账本已记录未完成”为 0，只表示 task ledger 当前没有活动记录，不能证明所有 Codex 对话和仓库工作都已完成；必须同时查看 Git / PR 收尾状态和相关任务上下文。
 - “昨日实际工作与后续”是日报第一主区块，来源是前一自然日实际活跃的 Codex 任务，而不是最近若干条 work ledger。状态区分 `completed`、`delivered_pending_trial`、`research_pending_implementation`、`in_progress`、`waiting_user` 和 `blocked`。
 - 活动账本缺失时，操作日志中的 `context_compacted` 事件按线程去重后成为降级活动，并从其上下文卡片“最近助手进展”提取至多两条短证据；Skill、Hook、Automation 和 Plugin 的已核实新增/更新/移除事件进入“昨日成果与系统变更”。
+- “等待条件与续作监控”来自结构化 follow-up，不从任意对话文本或 Automation prompt 猜测。外部条件进入等待前必须登记；自动续作绑定原线程的 ACTIVE heartbeat，并在每次检查后回写检查时间、下一检查和证据。
+- 单个 gate 等待不是整个目标 `blocked`。存在不污染等待证据、分支或业务状态的并行工作时，记录 `parallel_action` 并继续执行；所有安全轨道都无法推进时才标记全局阻塞。
+- 确定性且不需要业务选择的时间/状态条件默认 `resume_mode=auto`；只能通知或需要人工决策时分别使用 `notify`、`manual`。Automation 缺失、停用、投递线程不匹配或逾期未回写时，日报必须提示处理。
 - 已开发、测试或部署但尚未真实使用的成果必须标为“已交付待试用”，并给出最小试运行步骤；调研结论尚未应用时标为“调研完成待实施”。
 - 历史 work ledger 只保留索引链接，不在每日日报重复滚动展示旧条目；昨日成果必须来自昨日活动或操作日志证据。
 - “周期任务运行状态”读取项目 `.codex/continuity.json`。只有计划时间、调度器状态、退出码以及结构化状态或成功日志的新鲜度一致时才报告正常；证据过期必须报告延迟，明确失败证据报告失败。
@@ -189,6 +197,18 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 | `unknown` | 仍在宽限期或证据不足，不能推断成功或失败 |
 
 项目业务状态文件仍是事实源；日报不会因为 LaunchAgent“已加载”就推断业务运行成功。
+
+## 续作监控状态
+
+| 状态 | 含义 |
+|---|---|
+| `watching` | 等待条件尚未满足，监控继续；若有并行动作，目标仍可推进。 |
+| `ready` | 条件已有证据满足，应恢复原线程中的后续动作。 |
+| `needs_attention` | 监控失效、逾期或证据异常，需要修复监控或人工判断。 |
+| `completed` | 恢复动作和目标均已完成，不再提醒。 |
+| `cancelled` | 用户取消续作，不再提醒。 |
+
+周期任务健康和目标续作是两层事实：前者回答“任务是否运行成功”，后者回答“哪个目标依赖它、条件满足后做什么、由谁恢复”。日报必须同时展示，不能用周期任务成功替代目标后续。
 
 可用环境变量：
 
@@ -311,5 +331,6 @@ CODEX_REPOSITORY_CLOSURE_TIMEOUT_SECONDS
 - 不要把没有明确下一步的普通聊天写成任务。
 - 不要在已经判断“属于正式项目源码/文档”后仍把同一条目留在待确认区。
 - 不要在昨日有操作日志证据时继续重复展示几天前的固定成果列表。
+- 不要把一个等待 gate 写成整个目标停止；不要创建 heartbeat 后却不登记 follow-up，也不要只报告周期任务成功而漏掉依赖它的目标。
 - 不要永久删除 `cleanup_candidate`，除非用户有明确授权。
 - 不要把 token、Cookie、私钥、`.env` 值写入 ledger；脚本会做常见脱敏，但调用前仍应避免传入敏感文本。

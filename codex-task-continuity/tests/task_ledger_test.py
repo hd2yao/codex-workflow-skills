@@ -36,6 +36,120 @@ def fake_github_token():
 
 
 class TaskLedgerTest(unittest.TestCase):
+    def test_track_follow_up_upserts_by_thread_and_can_update_check_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "track-follow-up",
+                "--thread-id",
+                "thread-ya-fundmind",
+                "--title",
+                "YA FundMind V2 Final 观察",
+                "--goal",
+                "完成 3 次 post-RC 真实运行后发布 v2.0.0",
+                "--wait-condition",
+                "等待每日 21:30 scheduler run，当前 1/3",
+                "--resume-mode",
+                "auto",
+                "--resume-action",
+                "达到 3/3 后继续 Final 发布",
+                "--parallel-action",
+                "在独立 worktree 开发 Web Console",
+                "--monitor-automation-id",
+                "ya-fundmind-v2-rc-final",
+                "--monitor-schedule",
+                "每天 22:15",
+                "--next-check-at",
+                "2026-07-16T22:15:00+08:00",
+                "--recurring-task-id",
+                "ya-fundmind-daily",
+                "--project-name",
+                "YA FundMind",
+                "--project-path",
+                "/Users/dysania/program/AI/agent/ya-fundmind",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-2],
+                    "--parallel-action",
+                    "继续 Web Console TDD 与响应式验收",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            first_item = load_json(first.stdout)["follow_up"]
+            second_item = load_json(second.stdout)["follow_up"]
+            self.assertEqual(first_item["id"], second_item["id"])
+
+            listed = run_ledger(
+                ["list-follow-ups", "--status", "watching", "--format", "json"],
+                ledger_dir,
+            )
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            follow_ups = load_json(listed.stdout)["follow_ups"]
+            self.assertEqual(1, len(follow_ups))
+            self.assertEqual("auto", follow_ups[0]["resume_mode"])
+            self.assertEqual("ya-fundmind-v2-rc-final", follow_ups[0]["monitor"]["automation_id"])
+            self.assertIn("响应式验收", follow_ups[0]["parallel_action"])
+
+            updated = run_ledger(
+                [
+                    "update-follow-up",
+                    first_item["id"],
+                    "--status",
+                    "ready",
+                    "--last-checked-at",
+                    "2026-07-16T22:16:00+08:00",
+                    "--next-check-at",
+                    "2026-07-17T22:15:00+08:00",
+                    "--evidence",
+                    "readiness 2/3",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            updated_item = load_json(updated.stdout)["follow_up"]
+            self.assertEqual("ready", updated_item["status"])
+            self.assertEqual("2026-07-16T22:16:00+08:00", updated_item["last_checked_at"])
+            self.assertEqual("readiness 2/3", updated_item["evidence"])
+
+    def test_follow_up_check_times_require_timezone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            result = run_ledger(
+                [
+                    "track-follow-up",
+                    "--thread-id",
+                    "thread-1",
+                    "--title",
+                    "等待外部任务",
+                    "--goal",
+                    "继续目标",
+                    "--wait-condition",
+                    "等待任务完成",
+                    "--resume-action",
+                    "恢复执行",
+                    "--next-check-at",
+                    "2026-07-16T22:15:00",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("timezone", result.stderr)
+
     def test_record_activity_upserts_by_thread_and_date(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"

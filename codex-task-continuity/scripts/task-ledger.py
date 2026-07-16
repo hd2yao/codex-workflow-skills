@@ -45,6 +45,17 @@ ACTIVITY_STATUSES = {
     "blocked",
 }
 
+FOLLOW_UP_STATUSES = {
+    "watching",
+    "ready",
+    "needs_attention",
+    "completed",
+    "cancelled",
+}
+
+ACTIVE_FOLLOW_UP_STATUSES = {"watching", "ready", "needs_attention"}
+RESUME_MODES = {"auto", "notify", "manual"}
+
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"ghp_[A-Za-z0-9_]{20,}"),
@@ -133,11 +144,14 @@ def validate_activity_date(value):
 def load_index(path):
     path = index_path(path)
     if not path.exists():
-        return {"version": 1, "tasks": {}}
+        return {"version": 2, "tasks": {}, "follow_ups": {}}
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     if "tasks" not in data or not isinstance(data["tasks"], dict):
-        return {"version": 1, "tasks": {}}
+        data["tasks"] = {}
+    if "follow_ups" not in data or not isinstance(data["follow_ups"], dict):
+        data["follow_ups"] = {}
+    data["version"] = 2
     return data
 
 
@@ -209,6 +223,25 @@ def stable_import_id(status, artifact_path):
     return f"task_{today().replace('-', '')}_{status}_{digest}"
 
 
+def stable_follow_up_id(thread_id, title, project_path):
+    source = f"{thread_id}|{title}|{project_path}"
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:14]
+    return f"followup_{digest}"
+
+
+def validate_zoned_datetime(value, field_name):
+    if not value:
+        return ""
+    normalized = str(value).replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"invalid {field_name}: {value}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field_name} requires timezone: {value}")
+    return redact_text(str(value))
+
+
 def parse_tags(raw):
     if not raw:
         return []
@@ -233,6 +266,38 @@ def normalize_task(task):
     task.setdefault("blocker", "")
     task.setdefault("remind_on", "")
     return task
+
+
+def normalize_follow_up(follow_up):
+    follow_up = redact_value(follow_up)
+    status = follow_up.get("status") or "watching"
+    if status not in FOLLOW_UP_STATUSES:
+        raise ValueError(f"unknown follow-up status: {status}")
+    resume_mode = follow_up.get("resume_mode") or "auto"
+    if resume_mode not in RESUME_MODES:
+        raise ValueError(f"unknown resume mode: {resume_mode}")
+    if not isinstance(follow_up.get("project"), dict):
+        follow_up["project"] = {}
+    if not isinstance(follow_up.get("monitor"), dict):
+        follow_up["monitor"] = {}
+    follow_up["status"] = status
+    follow_up["resume_mode"] = resume_mode
+    follow_up["next_check_at"] = validate_zoned_datetime(
+        follow_up.get("next_check_at", ""), "next-check-at"
+    )
+    follow_up["last_checked_at"] = validate_zoned_datetime(
+        follow_up.get("last_checked_at", ""), "last-checked-at"
+    )
+    for field in (
+        "goal",
+        "wait_condition",
+        "resume_action",
+        "parallel_action",
+        "recurring_task_id",
+        "evidence",
+    ):
+        follow_up.setdefault(field, "")
+    return follow_up
 
 
 def upsert_task(path, task, event_type):
@@ -324,6 +389,103 @@ def update_task(args):
         save_index(path, data)
         append_event(path, "update", task)
     return {"task": task}
+
+
+def track_follow_up(args):
+    path = ledger_dir()
+    now = utc_now()
+    follow_up_id = stable_follow_up_id(args.thread_id, args.title, args.project_path)
+    with locked_ledger(path):
+        data = load_index(path)
+        existing = data["follow_ups"].get(follow_up_id, {})
+        follow_up = normalize_follow_up(
+            {
+                "id": follow_up_id,
+                "thread_id": redact_text(args.thread_id),
+                "title": redact_text(args.title),
+                "goal": redact_text(args.goal),
+                "status": args.status,
+                "wait_condition": redact_text(args.wait_condition),
+                "resume_mode": args.resume_mode,
+                "resume_action": redact_text(args.resume_action),
+                "parallel_action": redact_text(args.parallel_action),
+                "recurring_task_id": redact_text(args.recurring_task_id),
+                "next_check_at": args.next_check_at,
+                "last_checked_at": existing.get("last_checked_at", ""),
+                "monitor": {
+                    "automation_id": redact_text(args.monitor_automation_id),
+                    "schedule": redact_text(args.monitor_schedule),
+                    "target_thread_id": redact_text(args.monitor_target_thread_id or args.thread_id),
+                },
+                "project": {
+                    "name": redact_text(args.project_name),
+                    "path": redact_text(args.project_path),
+                },
+                "evidence": redact_text(args.evidence),
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+        )
+        data["follow_ups"][follow_up_id] = follow_up
+        save_index(path, data)
+        append_event(path, "track-follow-up", follow_up)
+    return {"follow_up": follow_up}
+
+
+def update_follow_up(args):
+    path = ledger_dir()
+    with locked_ledger(path):
+        data = load_index(path)
+        follow_up = data.get("follow_ups", {}).get(args.follow_up_id)
+        if not follow_up:
+            raise KeyError(f"follow-up not found: {args.follow_up_id}")
+        for field in (
+            "status",
+            "goal",
+            "wait_condition",
+            "resume_mode",
+            "resume_action",
+            "parallel_action",
+            "recurring_task_id",
+            "next_check_at",
+            "last_checked_at",
+            "evidence",
+        ):
+            value = getattr(args, field)
+            if value is not None:
+                follow_up[field] = redact_text(value)
+        monitor = follow_up.setdefault("monitor", {})
+        for argument, field in (
+            ("monitor_automation_id", "automation_id"),
+            ("monitor_schedule", "schedule"),
+            ("monitor_target_thread_id", "target_thread_id"),
+        ):
+            value = getattr(args, argument)
+            if value is not None:
+                monitor[field] = redact_text(value)
+        follow_up["updated_at"] = utc_now()
+        follow_up = normalize_follow_up(follow_up)
+        data["follow_ups"][follow_up["id"]] = follow_up
+        save_index(path, data)
+        append_event(path, "update-follow-up", follow_up)
+    return {"follow_up": follow_up}
+
+
+def list_follow_ups(args):
+    data = load_index(ledger_dir())
+    follow_ups = list(data.get("follow_ups", {}).values())
+    if args.status:
+        statuses = {item.strip() for item in args.status.split(",") if item.strip()}
+        follow_ups = [item for item in follow_ups if item.get("status") in statuses]
+    follow_ups = sorted(
+        (normalize_follow_up(item) for item in follow_ups),
+        key=lambda item: (
+            item.get("next_check_at") or "9999-99-99",
+            item.get("updated_at") or "",
+            item.get("title") or "",
+        ),
+    )
+    return {"follow_ups": follow_ups}
 
 
 def record_activity(args):
@@ -555,6 +717,14 @@ def print_result(result, output_format):
         task = result["task"]
         print(f"{task['id']} {task['status']} {task['title']}")
         return
+    if "follow_up" in result:
+        follow_up = result["follow_up"]
+        print(f"{follow_up['id']} {follow_up['status']} {follow_up['title']}")
+        return
+    if "follow_ups" in result:
+        for follow_up in result["follow_ups"]:
+            print(f"{follow_up['id']} {follow_up['status']} {follow_up['title']}")
+        return
     if "activity" in result:
         activity = result["activity"]
         print(f"{activity['id']} {activity['status']} {activity['title']}")
@@ -611,6 +781,49 @@ def build_parser():
     update.add_argument("--tags")
     update.add_argument("--format", choices=["text", "json"], default="text")
     update.set_defaults(func=update_task)
+
+    track_follow_up_cmd = subparsers.add_parser("track-follow-up")
+    track_follow_up_cmd.add_argument("--thread-id", required=True)
+    track_follow_up_cmd.add_argument("--title", required=True)
+    track_follow_up_cmd.add_argument("--goal", required=True)
+    track_follow_up_cmd.add_argument("--status", choices=sorted(FOLLOW_UP_STATUSES), default="watching")
+    track_follow_up_cmd.add_argument("--wait-condition", required=True)
+    track_follow_up_cmd.add_argument("--resume-mode", choices=sorted(RESUME_MODES), default="auto")
+    track_follow_up_cmd.add_argument("--resume-action", required=True)
+    track_follow_up_cmd.add_argument("--parallel-action", default="")
+    track_follow_up_cmd.add_argument("--recurring-task-id", default="")
+    track_follow_up_cmd.add_argument("--next-check-at", default="")
+    track_follow_up_cmd.add_argument("--monitor-automation-id", default="")
+    track_follow_up_cmd.add_argument("--monitor-schedule", default="")
+    track_follow_up_cmd.add_argument("--monitor-target-thread-id", default="")
+    track_follow_up_cmd.add_argument("--project-name", default="")
+    track_follow_up_cmd.add_argument("--project-path", default="")
+    track_follow_up_cmd.add_argument("--evidence", default="")
+    track_follow_up_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    track_follow_up_cmd.set_defaults(func=track_follow_up)
+
+    update_follow_up_cmd = subparsers.add_parser("update-follow-up")
+    update_follow_up_cmd.add_argument("follow_up_id")
+    update_follow_up_cmd.add_argument("--status", choices=sorted(FOLLOW_UP_STATUSES))
+    update_follow_up_cmd.add_argument("--goal")
+    update_follow_up_cmd.add_argument("--wait-condition")
+    update_follow_up_cmd.add_argument("--resume-mode", choices=sorted(RESUME_MODES))
+    update_follow_up_cmd.add_argument("--resume-action")
+    update_follow_up_cmd.add_argument("--parallel-action")
+    update_follow_up_cmd.add_argument("--recurring-task-id")
+    update_follow_up_cmd.add_argument("--next-check-at")
+    update_follow_up_cmd.add_argument("--last-checked-at")
+    update_follow_up_cmd.add_argument("--monitor-automation-id")
+    update_follow_up_cmd.add_argument("--monitor-schedule")
+    update_follow_up_cmd.add_argument("--monitor-target-thread-id")
+    update_follow_up_cmd.add_argument("--evidence")
+    update_follow_up_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    update_follow_up_cmd.set_defaults(func=update_follow_up)
+
+    list_follow_ups_cmd = subparsers.add_parser("list-follow-ups")
+    list_follow_ups_cmd.add_argument("--status", default=",".join(sorted(ACTIVE_FOLLOW_UP_STATUSES)))
+    list_follow_ups_cmd.add_argument("--format", choices=["text", "json"], default="text")
+    list_follow_ups_cmd.set_defaults(func=list_follow_ups)
 
     record_activity_cmd = subparsers.add_parser("record-activity")
     record_activity_cmd.add_argument("--date", required=True)
