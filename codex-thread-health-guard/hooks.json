@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/dysania/.codex/hooks/thread-health-guard-hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

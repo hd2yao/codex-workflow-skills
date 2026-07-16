@@ -6,11 +6,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "thread-health-guard.py"
+HOOK_SCRIPT = ROOT / "scripts" / "thread-health-guard-hook.py"
 SPEC = importlib.util.spec_from_file_location("thread_health_guard", SCRIPT)
 thread_health_guard = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 sys.modules["thread_health_guard"] = thread_health_guard
 SPEC.loader.exec_module(thread_health_guard)
+HOOK_SPEC = importlib.util.spec_from_file_location("thread_health_guard_hook", HOOK_SCRIPT)
+thread_health_guard_hook = importlib.util.module_from_spec(HOOK_SPEC)
+assert HOOK_SPEC and HOOK_SPEC.loader
+sys.modules["thread_health_guard_hook"] = thread_health_guard_hook
+HOOK_SPEC.loader.exec_module(thread_health_guard_hook)
 
 
 class ThreadHealthGuardTest(unittest.TestCase):
@@ -51,6 +57,24 @@ class ThreadHealthGuardTest(unittest.TestCase):
 
         self.assertEqual(result["risk_level"], "medium")
         self.assertFalse(result["should_create_new_thread"])
+
+    def test_extreme_context_alone_triggers_clean_continuation(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(tokens=1_000_000, cards=0, messages=[("用户", "继续推进当前实现。")])
+        )
+
+        self.assertEqual(result["risk_level"], "high")
+        self.assertTrue(result["should_create_new_thread"])
+        self.assertEqual(result["recommended_action"], "create_clean_continuation_thread")
+        self.assertIn("极端长上下文达到自动接续阈值", result["evidence"])
+
+    def test_many_context_cards_alone_triggers_clean_continuation(self):
+        result = thread_health_guard.score_snapshot(
+            self.snapshot(tokens=20_000, cards=4, messages=[("用户", "继续推进当前实现。")])
+        )
+
+        self.assertEqual(result["risk_level"], "high")
+        self.assertTrue(result["should_create_new_thread"])
 
     def test_pollution_without_context_pressure_is_not_high_risk(self):
         result = thread_health_guard.score_snapshot(
@@ -123,6 +147,11 @@ class ThreadHealthGuardTest(unittest.TestCase):
         title = thread_health_guard.title_for_continuation("一个很长的线程标题", "abcdef123456")
 
         self.assertEqual(title, "接续: 一个很长的线程标题 [from abcdef12]")
+
+    def test_hook_prefers_session_id_for_thread_selection(self):
+        argv = thread_health_guard_hook.argv_from_hook_input({"session_id": "abc-123"})
+
+        self.assertEqual(argv, ["--format", "json", "--thread-id", "abc-123"])
 
 
 if __name__ == "__main__":

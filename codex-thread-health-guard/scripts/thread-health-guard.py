@@ -21,6 +21,8 @@ DEFAULT_BRIDGE_DIR = Path(
         "/Users/dysania/program/tools/agent-tools/codex-thread-bridge",
     )
 )
+EXTREME_TOKEN_THRESHOLD = 1_000_000
+EXTREME_CARD_THRESHOLD = 4
 
 POLLUTION_PATTERNS = (
     re.compile(r"不是这个|不对|搞错|错了|理解错|跑偏|偏了|重来|重新来"),
@@ -197,10 +199,17 @@ def score_snapshot(snapshot: ThreadSnapshot) -> dict[str, Any]:
     has_context_pressure = context_score >= 3
     has_contamination_or_struggle = pollution_score + struggle_score >= 3
     has_phase_transition = phase_transition_score >= 4
+    has_extreme_context = (
+        snapshot.tokens_used >= EXTREME_TOKEN_THRESHOLD
+        or snapshot.context_card_count >= EXTREME_CARD_THRESHOLD
+    )
+    if has_extreme_context:
+        evidence.append("极端长上下文达到自动接续阈值")
 
     would_create_new_thread = (
         (has_context_pressure and has_contamination_or_struggle and total >= 6)
         or has_phase_transition
+        or has_extreme_context
     )
 
     if migration_blockers and would_create_new_thread:
@@ -304,7 +313,60 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def scan_recent(codex_home: Path, limit: int, max_events: int) -> dict[str, Any]:
+    bridge = load_bridge_module()
+    threads = []
+    for record in bridge.list_threads(codex_home, limit=limit):
+        messages = bridge.recent_rollout_messages(record.rollout_path, max_events=max_events)
+        snapshot = ThreadSnapshot(
+            thread_id=record.id,
+            title=record.title,
+            cwd=record.cwd,
+            workspace_hint=record.workspace_hint,
+            tokens_used=record.tokens_used,
+            context_card_count=len(record.context_card_paths),
+            rollout_path=str(record.rollout_path),
+            messages=messages,
+        )
+        score = score_snapshot(snapshot)
+        threads.append(
+            {
+                "thread_id": record.id,
+                "title": record.title,
+                "cwd": record.cwd,
+                "tokens_used": record.tokens_used,
+                "context_card_count": len(record.context_card_paths),
+                "risk_level": score["risk_level"],
+                "recommended_action": score["recommended_action"],
+                "should_create_new_thread": score["should_create_new_thread"],
+                "scores": score["scores"],
+                "evidence": score["evidence"],
+                "migration_blockers": score["migration_blockers"],
+                "suggested_title": score["suggested_title"],
+            }
+        )
+    high_count = sum(1 for item in threads if item["risk_level"] == "high")
+    return {"scan_limit": limit, "high_count": high_count, "threads": threads}
+
+
 def format_markdown(result: dict[str, Any]) -> str:
+    if "threads" in result:
+        lines = [
+            "# Codex 线程健康批量扫描",
+            "",
+            f"- 扫描数量: `{result.get('scan_limit', len(result['threads']))}`",
+            f"- 高风险数量: `{result.get('high_count', 0)}`",
+            "",
+        ]
+        for item in result["threads"]:
+            evidence = "；".join(item.get("evidence") or ["无明显证据"])
+            lines.append(
+                f"- `{item['thread_id'][:8]}` {clean_inline(item['title'], 48)}: "
+                f"{item['risk_level']} / {item['recommended_action']} / "
+                f"tokens={item['tokens_used']} cards={item['context_card_count']} / {evidence}"
+            )
+        return "\n".join(lines)
+
     lines = [
         "# Codex 线程健康检查",
         "",
@@ -340,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thread-id", default="")
     parser.add_argument("--max-events", type=int, default=24)
     parser.add_argument("--pack-output", default="")
+    parser.add_argument("--scan-recent", type=int, default=0)
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     return parser
 
@@ -347,7 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = build_result(args)
+        if args.scan_recent:
+            result = scan_recent(Path(args.codex_home).expanduser(), args.scan_recent, args.max_events)
+        else:
+            result = build_result(args)
     except Exception as exc:
         result = {
             "risk_level": "unknown",
