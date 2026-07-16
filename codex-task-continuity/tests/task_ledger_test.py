@@ -36,6 +36,310 @@ def fake_github_token():
 
 
 class TaskLedgerTest(unittest.TestCase):
+    def test_repository_resolution_upserts_and_lists_by_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "record-repository-resolution",
+                "--date",
+                "2026-07-16",
+                "--finding-id",
+                "RC-EXAMPLE001",
+                "--repository",
+                "hd2yao/example",
+                "--project-name",
+                "示例项目",
+                "--branch",
+                "feature/demo",
+                "--status",
+                "active_deferred",
+                "--stage",
+                "功能仍在开发",
+                "--summary",
+                "对应任务今天仍在实现 API",
+                "--next-action",
+                "任务完成后自动创建 PR 并合并",
+                "--thread-id",
+                "thread-example",
+                "--thread-title",
+                "实现示例 API",
+                "--evidence",
+                "/internal/report.json",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-4],
+                    "--summary",
+                    "API 和测试仍在同一任务中推进",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            listed = run_ledger(
+                ["list-repository-resolutions", "--date", "2026-07-16", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            resolutions = load_json(listed.stdout)["resolutions"]
+            self.assertEqual(1, len(resolutions))
+            self.assertEqual("active_deferred", resolutions[0]["status"])
+            self.assertIn("仍在同一任务", resolutions[0]["summary"])
+            self.assertEqual("/internal/report.json", resolutions[0]["evidence"])
+
+    def test_repository_resolution_date_cannot_escape_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_ledger(
+                [
+                    "record-repository-resolution",
+                    "--date",
+                    "../escape",
+                    "--finding-id",
+                    "RC-1",
+                    "--repository",
+                    "example",
+                    "--status",
+                    "failed",
+                    "--summary",
+                    "失败",
+                    "--format",
+                    "json",
+                ],
+                Path(tmp) / "ledger",
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("invalid resolution date", result.stderr)
+
+    def test_track_follow_up_upserts_by_thread_and_can_update_check_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "track-follow-up",
+                "--thread-id",
+                "thread-ya-fundmind",
+                "--title",
+                "YA FundMind V2 Final 观察",
+                "--goal",
+                "完成 3 次 post-RC 真实运行后发布 v2.0.0",
+                "--wait-condition",
+                "等待每日 21:30 scheduler run，当前 1/3",
+                "--resume-mode",
+                "auto",
+                "--resume-action",
+                "达到 3/3 后继续 Final 发布",
+                "--parallel-action",
+                "在独立 worktree 开发 Web Console",
+                "--monitor-automation-id",
+                "ya-fundmind-v2-rc-final",
+                "--monitor-schedule",
+                "每天 22:15",
+                "--next-check-at",
+                "2026-07-16T22:15:00+08:00",
+                "--recurring-task-id",
+                "ya-fundmind-daily",
+                "--project-name",
+                "YA FundMind",
+                "--project-path",
+                "/Users/dysania/program/AI/agent/ya-fundmind",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-2],
+                    "--parallel-action",
+                    "继续 Web Console TDD 与响应式验收",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            first_item = load_json(first.stdout)["follow_up"]
+            second_item = load_json(second.stdout)["follow_up"]
+            self.assertEqual(first_item["id"], second_item["id"])
+
+            listed = run_ledger(
+                ["list-follow-ups", "--status", "watching", "--format", "json"],
+                ledger_dir,
+            )
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            follow_ups = load_json(listed.stdout)["follow_ups"]
+            self.assertEqual(1, len(follow_ups))
+            self.assertEqual("auto", follow_ups[0]["resume_mode"])
+            self.assertEqual("ya-fundmind-v2-rc-final", follow_ups[0]["monitor"]["automation_id"])
+            self.assertIn("响应式验收", follow_ups[0]["parallel_action"])
+
+            updated = run_ledger(
+                [
+                    "update-follow-up",
+                    first_item["id"],
+                    "--status",
+                    "ready",
+                    "--last-checked-at",
+                    "2026-07-16T22:16:00+08:00",
+                    "--next-check-at",
+                    "2026-07-17T22:15:00+08:00",
+                    "--evidence",
+                    "readiness 2/3",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            updated_item = load_json(updated.stdout)["follow_up"]
+            self.assertEqual("ready", updated_item["status"])
+            self.assertEqual("2026-07-16T22:16:00+08:00", updated_item["last_checked_at"])
+            self.assertEqual("readiness 2/3", updated_item["evidence"])
+
+    def test_follow_up_check_times_require_timezone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            result = run_ledger(
+                [
+                    "track-follow-up",
+                    "--thread-id",
+                    "thread-1",
+                    "--title",
+                    "等待外部任务",
+                    "--goal",
+                    "继续目标",
+                    "--wait-condition",
+                    "等待任务完成",
+                    "--resume-action",
+                    "恢复执行",
+                    "--next-check-at",
+                    "2026-07-16T22:15:00",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("timezone", result.stderr)
+
+    def test_record_activity_upserts_by_thread_and_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            base_args = [
+                "record-activity",
+                "--date",
+                "2026-07-14",
+                "--thread-id",
+                "thread-recipe",
+                "--title",
+                "设计菜谱库存系统",
+                "--status",
+                "delivered_pending_trial",
+                "--summary",
+                "PWA 已部署并通过测试",
+                "--next-action",
+                "使用真实食材试运行 1-3 天",
+                "--project-path",
+                "/Users/dysania/program/env/pantry-recipe-pwa",
+                "--format",
+                "json",
+            ]
+
+            first = run_ledger(base_args, ledger_dir)
+            second = run_ledger(
+                [
+                    *base_args[:-2],
+                    "--summary",
+                    "PWA 已部署，等待真实使用反馈",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+            listed = run_ledger(
+                ["list-activity", "--date", "2026-07-14", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            activities = load_json(listed.stdout)["activities"]
+            self.assertEqual(1, len(activities))
+            self.assertEqual("thread-recipe", activities[0]["thread_id"])
+            self.assertEqual("delivered_pending_trial", activities[0]["status"])
+            self.assertIn("真实使用反馈", activities[0]["summary"])
+
+    def test_clear_activity_removes_only_requested_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            for day in ("2026-07-13", "2026-07-14"):
+                result = run_ledger(
+                    [
+                        "record-activity",
+                        "--date",
+                        day,
+                        "--thread-id",
+                        f"thread-{day}",
+                        "--title",
+                        "示例任务",
+                        "--status",
+                        "completed",
+                        "--summary",
+                        "完成",
+                        "--format",
+                        "json",
+                    ],
+                    ledger_dir,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            cleared = run_ledger(
+                ["clear-activity", "--date", "2026-07-14", "--format", "json"],
+                ledger_dir,
+            )
+            remaining = run_ledger(
+                ["list-activity", "--date", "2026-07-13", "--format", "json"],
+                ledger_dir,
+            )
+
+            self.assertEqual(cleared.returncode, 0, cleared.stderr)
+            self.assertEqual(1, load_json(cleared.stdout)["removed_count"])
+            self.assertEqual(1, len(load_json(remaining.stdout)["activities"]))
+
+    def test_activity_date_must_be_iso_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_dir = Path(tmp) / "ledger"
+            result = run_ledger(
+                [
+                    "record-activity",
+                    "--date",
+                    "../escape",
+                    "--title",
+                    "示例",
+                    "--status",
+                    "completed",
+                    "--summary",
+                    "完成",
+                    "--format",
+                    "json",
+                ],
+                ledger_dir,
+            )
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("invalid activity date", result.stderr)
+
     def test_add_list_and_update_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"

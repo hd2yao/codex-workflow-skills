@@ -6,11 +6,31 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import datetime as dt
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
-LEDGER = Path(__file__).with_name("task-ledger.py")
+def companion_script(name):
+    local = Path(__file__).with_name(name)
+    skill_root = Path(
+        os.environ.get(
+            "CODEX_TASK_CONTINUITY_SKILL_DIR",
+            "~/.codex/skills/codex-task-continuity",
+        )
+    ).expanduser()
+    installed = skill_root / "scripts" / name
+    if Path(__file__).parent.name == "hooks" and installed.exists():
+        return installed
+    if local.exists():
+        return local
+    if installed.exists():
+        return installed
+    return local
+
+
+LEDGER = companion_script("task-ledger.py")
 ACTIVE_STATUS = "idea,todo,in_progress,waiting_user,blocked,needs_review,cleanup_candidate"
 MARKERS = [
     (re.compile(r"^\s*(?:TODO|待办|下一步|需要继续|继续任务)\s*[:：]\s*(.+?)\s*$", re.I), "todo"),
@@ -25,6 +45,20 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(cookie|set-cookie)\s*[:=]\s*\S+"),
     re.compile(r"(?i)(sessionid|password|secret|token|api[_-]?key)\s*=\s*\S+"),
 ]
+WORKFLOW_CHANGE_LABELS = {
+    "skill_added": "Skill 新增",
+    "skill_updated": "Skill 更新",
+    "skill_removed": "Skill 移除",
+    "hook_added": "Hook 新增",
+    "hook_updated": "Hook 更新",
+    "hook_removed": "Hook 移除",
+    "automation_added": "Automation 新增",
+    "automation_updated": "Automation 更新",
+    "automation_removed": "Automation 移除",
+    "plugin_added": "Plugin 新增",
+    "plugin_updated": "Plugin 更新",
+    "plugin_removed": "Plugin 移除",
+}
 
 
 def redact(text):
@@ -74,6 +108,24 @@ def work_ledger_root():
     return Path(os.environ.get("CODEX_WORK_LEDGER_DIR", "~/.codex/work-ledger")).expanduser()
 
 
+def operation_ledger_path():
+    return Path(
+        os.environ.get("CODEX_OPERATION_LEDGER_PATH", "~/.codex/operation-ledger/events.jsonl")
+    ).expanduser()
+
+
+def automations_root():
+    return Path(os.environ.get("CODEX_AUTOMATIONS_DIR", "~/.codex/automations")).expanduser()
+
+
+def local_timezone():
+    name = os.environ.get("CODEX_LOCAL_TIMEZONE", "Asia/Shanghai")
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError):
+        return ZoneInfo("Asia/Shanghai")
+
+
 def repository_closure_root():
     return Path(
         os.environ.get(
@@ -87,7 +139,16 @@ def repository_closure_scanner():
     return Path(
         os.environ.get(
             "CODEX_REPOSITORY_CLOSURE_SCANNER",
-            Path(__file__).with_name("repository-closure-audit.py"),
+            companion_script("repository-closure-audit.py"),
+        )
+    ).expanduser()
+
+
+def recurring_task_scanner():
+    return Path(
+        os.environ.get(
+            "CODEX_RECURRING_TASK_SCANNER",
+            companion_script("recurring-task-audit.py"),
         )
     ).expanduser()
 
@@ -344,6 +405,440 @@ def active_tasks(limit=8):
     return result.get("tasks", [])[:limit]
 
 
+def active_follow_ups(limit=20):
+    result = ledger_command(
+        ["list-follow-ups", "--status", "watching,ready,needs_attention", "--format", "json"]
+    )
+    return result.get("follow_ups", [])[:limit]
+
+
+def parse_operation_time(value):
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def automation_config(automation_id):
+    if not automation_id or not re.fullmatch(r"[A-Za-z0-9._-]+", str(automation_id)):
+        return None
+    path = automations_root() / str(automation_id) / "automation.toml"
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(config, dict) or config.get("id") != automation_id:
+        return None
+    return config
+
+
+def enrich_follow_ups(follow_ups, recurring_report):
+    recurring_by_id = {
+        item.get("id"): item
+        for item in recurring_report.get("tasks", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    now = dt.datetime.now(local_timezone())
+    enriched = []
+    for source in follow_ups:
+        item = dict(source)
+        monitor = dict(item.get("monitor") or {})
+        item["monitor"] = monitor
+        reasons = []
+        automation_id = monitor.get("automation_id") or ""
+        config = automation_config(automation_id) if automation_id else None
+        automation_status = config.get("status") if config else ""
+        item["automation_status"] = automation_status
+
+        resume_mode = item.get("resume_mode") or "auto"
+        if resume_mode in {"auto", "notify"}:
+            if not item.get("next_check_at"):
+                reasons.append("未登记下次检查时间")
+            if not automation_id:
+                reasons.append("未登记监控 Automation")
+            elif config is None:
+                reasons.append("监控 Automation 不存在")
+            else:
+                if automation_status != "ACTIVE":
+                    reasons.append("监控 Automation 未处于 ACTIVE")
+                target_thread_id = config.get("target_thread_id") or ""
+                expected_thread_id = monitor.get("target_thread_id") or item.get("thread_id") or ""
+                if expected_thread_id and target_thread_id != expected_thread_id:
+                    reasons.append("监控 Automation 投递线程不匹配")
+
+        next_check = parse_operation_time(item.get("next_check_at"))
+        last_checked = parse_operation_time(item.get("last_checked_at"))
+        if next_check is not None and next_check.astimezone(local_timezone()) < now:
+            if last_checked is None or last_checked < next_check:
+                reasons.append("下次检查已逾期且未回写")
+
+        recurring_task_id = item.get("recurring_task_id") or ""
+        recurring = recurring_by_id.get(recurring_task_id)
+        if recurring:
+            item["recurring_task"] = recurring
+            if recurring.get("status") in {"failed", "overdue"}:
+                reasons.append(f"关联周期任务状态为 {recurring.get('status')}")
+        elif recurring_task_id:
+            reasons.append("关联周期任务未找到")
+
+        if item.get("status") == "needs_attention":
+            reasons.append("续作记录已标记需要处理")
+
+        item["monitor_reasons"] = list(dict.fromkeys(reasons))
+        if reasons:
+            item["monitor_state"] = "attention"
+            item["monitor_label"] = "需要处理"
+            item["user_action"] = "需要处理监控：" + "；".join(item["monitor_reasons"])
+        elif item.get("status") == "ready":
+            item["monitor_state"] = "ready"
+            item["monitor_label"] = "条件已满足，待续作"
+            item["user_action"] = "无需；自动续作会在绑定任务中继续，或由日报提示人工恢复。"
+        elif resume_mode == "auto":
+            item["monitor_state"] = "watching"
+            item["monitor_label"] = "自动监控中"
+            item["user_action"] = "无需；监控 Automation 会在条件检查后恢复原任务。"
+        elif resume_mode == "notify":
+            item["monitor_state"] = "watching"
+            item["monitor_label"] = "监控后通知"
+            item["user_action"] = "条件变化后查看通知并决定是否恢复。"
+        else:
+            item["monitor_state"] = "manual"
+            item["monitor_label"] = "等待人工恢复"
+            item["user_action"] = "条件满足后需要手动恢复原任务。"
+        enriched.append(item)
+    return enriched
+
+
+def operation_event_score(event):
+    return (
+        len(event.get("changes") or []) * 100
+        + len(event.get("related_threads") or []) * 20
+        + (10 if event.get("project") else 0)
+        + len(str(event.get("summary") or ""))
+    )
+
+
+def previous_day_operation_events(limit=5000):
+    path = operation_ledger_path()
+    if not path.exists():
+        return []
+    target_day = dt.date.fromisoformat(local_yesterday())
+    events = []
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return []
+    with handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("status") not in {None, "success"}:
+                continue
+            occurred_at = parse_operation_time(event.get("occurred_at"))
+            if occurred_at is None or occurred_at.astimezone(local_timezone()).date() != target_day:
+                continue
+            events.append(event)
+            if len(events) >= limit:
+                break
+
+    deduplicated = {}
+    for event in events:
+        actor = event.get("actor") or {}
+        thread = event.get("thread") or {}
+        key = (
+            event.get("action") or "",
+            actor.get("label") or actor.get("id") or "",
+            thread.get("id") or "",
+            event.get("occurred_at") or "",
+        )
+        existing = deduplicated.get(key)
+        if existing is None or operation_event_score(event) > operation_event_score(existing):
+            deduplicated[key] = event
+    return sorted(deduplicated.values(), key=lambda item: item.get("occurred_at") or "")
+
+
+def operation_evidence_label(event):
+    for evidence in event.get("evidence") or []:
+        if isinstance(evidence, dict) and evidence.get("path"):
+            return evidence["path"]
+    return event.get("occurred_at") or "操作日志"
+
+
+def context_card_recent_progress(event, limit=2, max_chars=420):
+    path = None
+    for evidence in event.get("evidence") or []:
+        if not isinstance(evidence, dict) or not evidence.get("path"):
+            continue
+        candidate = Path(evidence["path"]).expanduser()
+        if evidence.get("kind") == "context_card" or "context-card" in candidate.name:
+            path = candidate
+            break
+    if path is None or not path.is_file():
+        return ""
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return ""
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+
+    progress = []
+    in_progress_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## 最近助手进展":
+            in_progress_section = True
+            continue
+        if in_progress_section and stripped.startswith("## "):
+            break
+        if not in_progress_section or not stripped.startswith("- "):
+            continue
+        item = stripped[2:].strip()
+        item = re.sub(r"^`[^`]+`\s+\*\*助手\*\*:\s*", "", item)
+        item = re.sub(r"\s+", " ", redact(item)).strip()
+        if item:
+            progress.append(item)
+
+    selected = "；".join(progress[-limit:])
+    if len(selected) > max_chars:
+        selected = selected[: max_chars - 1].rstrip() + "…"
+    return selected
+
+
+def previous_day_operation_changes(events=None, limit=12):
+    events = events if events is not None else previous_day_operation_events()
+    grouped = {}
+    for event in events:
+        action = event.get("action") or ""
+        if action not in WORKFLOW_CHANGE_LABELS:
+            continue
+        actor = event.get("actor") or {}
+        component = actor.get("label") or actor.get("id") or event.get("title") or "未知组件"
+        grouped.setdefault((action, component), []).append(event)
+
+    changes = []
+    for (action, component), items in grouped.items():
+        items = sorted(items, key=lambda item: item.get("occurred_at") or "")
+        best = max(items, key=operation_event_score)
+        summaries = []
+        for item in items:
+            summary = str(item.get("summary") or "").strip()
+            if summary and summary not in summaries:
+                summaries.append(summary)
+        changes.append(
+            {
+                "action": action,
+                "label": WORKFLOW_CHANGE_LABELS[action],
+                "component": component,
+                "summary": "；".join(summaries[-3:]) or f"{component} 已发生可核实变更。",
+                "occurred_at": best.get("occurred_at") or "",
+                "evidence": operation_evidence_label(best),
+            }
+        )
+    return sorted(changes, key=lambda item: item.get("occurred_at") or "", reverse=True)[:limit]
+
+
+def operation_fallback_activities(events=None, limit=12):
+    events = events if events is not None else previous_day_operation_events()
+    grouped = {}
+    for event in events:
+        if event.get("action") != "context_compacted":
+            continue
+        thread = event.get("thread") or {}
+        project = event.get("project") or {}
+        thread_id = thread.get("id") or ""
+        title = thread.get("title") or ""
+        project_name = project.get("name") or ""
+        if not thread_id or not title:
+            continue
+        if project_name == "codex-digest-archive" or "摘要归档" in title:
+            continue
+        current = grouped.get(thread_id)
+        if current is None or (event.get("occurred_at") or "") > (current.get("occurred_at") or ""):
+            grouped[thread_id] = event
+
+    activities = []
+    for thread_id, event in grouped.items():
+        thread = event.get("thread") or {}
+        project = event.get("project") or {}
+        progress = context_card_recent_progress(event)
+        if progress:
+            summary = f"上下文卡片记录的最近进展：{progress}（仅作为昨日进展证据，不据此推断任务完成。）"
+            next_match = re.search(r"(?:下一步|后续)\s*[:：]?\s*([^。；]+)", progress)
+            next_action = next_match.group(1).strip() if next_match else "回到该项目任务继续尚未完成的步骤。"
+        else:
+            summary = "操作日志确认该任务昨日活跃并生成了上下文压缩卡片；线程接口采集失败，未据此推断完成状态。"
+            next_action = "回到该项目任务核对当前阶段并继续未完成步骤。"
+        activities.append(
+            {
+                "thread_id": thread_id,
+                "title": thread.get("title") or "未命名任务",
+                "status": "in_progress",
+                "summary": summary,
+                "next_action": next_action,
+                "project_name": project.get("name") or "",
+                "project_path": project.get("path") or "",
+                "evidence": operation_evidence_label(event),
+                "source": "operation_ledger_fallback",
+                "occurred_at": event.get("occurred_at") or "",
+            }
+        )
+    return sorted(activities, key=lambda item: item.get("occurred_at") or "", reverse=True)[:limit]
+
+
+def activity_ledger_activities():
+    path = ledger_root() / "activity" / f"{local_yesterday()}.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    activities = data.get("activities", {})
+    if isinstance(activities, dict):
+        activities = list(activities.values())
+    if not isinstance(activities, list):
+        return []
+    return sorted(
+        [item for item in activities if isinstance(item, dict)],
+        key=lambda item: (item.get("status") or "", item.get("title") or "", item.get("thread_id") or ""),
+    )
+
+
+def previous_day_activity_bundle(operation_events=None):
+    activities = activity_ledger_activities()
+    if activities:
+        return activities, "activity_ledger"
+    fallback = operation_fallback_activities(operation_events)
+    if fallback:
+        return fallback, "operation_ledger_fallback"
+    return [], "missing"
+
+
+def previous_day_activities():
+    return previous_day_activity_bundle()[0]
+
+
+def today_repository_resolutions():
+    try:
+        result = ledger_command(
+            [
+                "list-repository-resolutions",
+                "--date",
+                local_today(),
+                "--format",
+                "json",
+            ]
+        )
+    except RuntimeError:
+        return []
+    return [item for item in result.get("resolutions", []) if isinstance(item, dict)]
+
+
+def compact_digest_text(value, max_chars=120):
+    text = redact(value or "").strip()
+    for prefix in (
+        "上下文卡片记录的最近进展：",
+        "最近助手进展：",
+        "结果：",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].lstrip()
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    text = re.sub(r"（仅作为[^）]*）", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    boundary = max(text.rfind("。", 8, max_chars), text.rfind("；", 8, max_chars))
+    if boundary >= 8:
+        return text[: boundary + 1].strip()
+    return text[: max_chars - 1].rstrip("，,；;：: ") + "…"
+
+
+def activity_project_name(activity):
+    generic = {"", "program", "tools", "env", "ai", "无项目", "未知项目"}
+    name = str(activity.get("project_name") or "").strip()
+    if name.lower() not in generic:
+        return name
+    path = str(activity.get("project_path") or "").strip()
+    if path:
+        candidate = Path(path).name.strip()
+        if candidate.lower() not in generic:
+            return candidate
+    return str(activity.get("title") or "未命名项目").strip()
+
+
+def repository_stage_label(finding):
+    return {
+        "uncommitted_changes": "整理未提交改动",
+        "committed_not_merged": "提交已完成，尚未合并",
+        "pr_not_merged": "PR 尚未合并",
+        "stale_branch": "长期未活动分支",
+        "merged_cleanup": "已合并，等待清理",
+        "repository_review": "仓库状态检查",
+    }.get(finding.get("workflow_stage"), finding.get("workflow_stage") or "仓库状态检查")
+
+
+def append_repository_item(lines, item, *, resolution=False):
+    project = item.get("project_name") or item.get("repository") or "未知项目"
+    branch = item.get("branch") or "detached HEAD"
+    stage = item.get("stage") if resolution else repository_stage_label(item)
+    summary = item.get("summary") if resolution else item.get("reason")
+    next_action = item.get("next_action") or "由对应任务继续收尾。"
+    lines.append(
+        f"- **{markdown_label(project)}** / `{markdown_label(branch)}`：{markdown_label(stage or '仓库处理')}"
+    )
+    lines.append(f"  当前：{markdown_label(compact_digest_text(summary or '未记录当前状态'))}")
+    lines.append(f"  后续：{markdown_label(compact_digest_text(next_action))}")
+
+
+def repository_closure_lines(report, resolutions):
+    lines = ["", "## 仓库收尾", ""]
+    visible = [item for item in resolutions if item.get("status") != "ignored"]
+    if visible:
+        groups = (
+            ("今日已处理", {"completed"}),
+            ("近期开发暂不合并", {"active_deferred", "planned"}),
+            ("需要关注", {"failed"}),
+        )
+        for title, statuses in groups:
+            items = [item for item in visible if item.get("status") in statuses]
+            if not items:
+                continue
+            lines.extend([f"### {title}", ""])
+            for item in items:
+                append_repository_item(lines, item, resolution=True)
+        return lines
+
+    findings = report.get("findings", [])
+    if not findings:
+        lines.append("- 当前没有需要收尾的仓库。")
+        return lines
+    prioritized = sorted(
+        findings,
+        key=lambda item: (
+            0 if item.get("disposition") in {"auto_finish", "auto_cleanup"} else 1,
+            -(item.get("age_days") or 0),
+            item.get("repository") or "",
+        ),
+    )[:3]
+    lines.extend(["### 待自动处理", ""])
+    for item in prioritized:
+        append_repository_item(lines, item)
+    remaining = len(findings) - len(prioritized)
+    if remaining > 0:
+        lines.append(f"- 其余 {remaining} 项留在内部队列，后续按仓库级动作预算处理，不需要你逐项确认。")
+    return lines
+
+
 def recent_completed_work(limit=5):
     index = work_ledger_root() / "index.json"
     if not index.exists():
@@ -380,6 +875,45 @@ def empty_repository_closure_report(warning=None):
     }
 
 
+def empty_recurring_task_report(warning=None):
+    return {
+        "schema_version": 1,
+        "task_count": 0,
+        "counts": {"success": 0, "overdue": 0, "failed": 0, "unknown": 0},
+        "tasks": [],
+        "warnings": [warning] if warning else [],
+    }
+
+
+def run_recurring_task_audit():
+    command = [
+        sys.executable,
+        str(recurring_task_scanner()),
+        "--root",
+        str(program_root()),
+        "--format",
+        "json",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return empty_recurring_task_report(f"周期任务扫描未完成：{exc}")
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or f"退出码 {result.returncode}"
+        return empty_recurring_task_report(f"周期任务扫描未完成：{detail}")
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return empty_recurring_task_report(f"周期任务扫描结果无法解析：{exc}")
+    return report if isinstance(report, dict) else empty_recurring_task_report("周期任务扫描结果格式无效")
+
+
 def load_repository_closure_report():
     path = repository_closure_report_path()
     if not path.exists():
@@ -404,6 +938,13 @@ def run_repository_closure_audit():
         command.extend(["--root", str(root)])
     if repository_closure_include_github():
         command.append("--include-github")
+    if os.environ.get("CODEX_REPOSITORY_CLOSURE_REFRESH_REMOTES", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        command.append("--refresh-remotes")
     try:
         timeout = max(10, int(os.environ.get("CODEX_REPOSITORY_CLOSURE_TIMEOUT_SECONDS", "180")))
     except ValueError:
@@ -514,6 +1055,9 @@ def is_broad_manifest_path(path):
     item = Path(path).expanduser()
     known_containers = {
         Path("~/.codex").expanduser(),
+        Path(tempfile.gettempdir()),
+        Path("/tmp"),
+        Path("/private/tmp"),
         program_root(),
         program_root() / "tools",
         program_root() / "documents",
@@ -645,7 +1189,42 @@ def is_managed_artifact_path(path):
     ]
     if any(is_relative_to_path(item, root) for root in managed_roots):
         return True
-    return is_git_tracked_file(item) or is_git_managed_subtree(item)
+    return (
+        is_git_tracked_file(item)
+        or is_git_managed_subtree(item)
+        or is_established_project_root(item)
+        or project_member_root(item) is not None
+    )
+
+
+def is_established_project_root(path):
+    item = Path(path).expanduser()
+    if not item.is_dir():
+        return False
+    try:
+        relative_parts = item.resolve().relative_to(program_root().resolve()).parts
+    except (OSError, ValueError):
+        return False
+    if any(part in {"_external", "_inbox", "_archive", "needs-review", "trash-candidates"} for part in relative_parts):
+        return False
+    if not ((item / "README.md").exists() or (item / "readme.md").exists()):
+        return False
+    component_dirs = sum((item / name).is_dir() for name in ("backend", "frontend", "src", "docs", "tests"))
+    return len(project_markers(item)) >= 2 or component_dirs >= 2
+
+
+def project_member_root(path):
+    item = Path(path).expanduser()
+    try:
+        root = program_root().resolve()
+        current = item.resolve().parent
+    except OSError:
+        return None
+    while current != root and is_relative_to_path(current, root):
+        if is_project_like_directory(current) or is_established_project_root(current):
+            return current
+        current = current.parent
+    return None
 
 
 def is_project_like_directory(path):
@@ -737,6 +1316,9 @@ def is_auto_deletable_transient_path(path):
         return False
     name = item.name.lower()
     if name.startswith("codex-clipboard-"):
+        return True
+    normalized = item.as_posix().lower()
+    if "com.tencent.xinwechat" in normalized and "/temp/rwtemp/" in normalized:
         return True
     temp_roots = {
         Path(tempfile.gettempdir()).resolve(),
@@ -1127,21 +1709,155 @@ def upsert_pending_artifacts(entries):
     return [pending_entry_from_record(record) for record in active_pending_records(data)]
 
 
-def daily_card_markdown(tasks, artifacts, recent_work=None, repository_closure=None):
+def daily_card_markdown(
+    tasks,
+    artifacts,
+    recent_work=None,
+    repository_closure=None,
+    previous_activity=None,
+    recurring_tasks=None,
+    daily_changes=None,
+    activity_source="activity_ledger",
+    follow_ups=None,
+    repository_resolutions=None,
+):
     recent_work = recent_work or []
     repository_closure = repository_closure or empty_repository_closure_report()
+    previous_activity = previous_activity or []
+    recurring_tasks = recurring_tasks or empty_recurring_task_report()
+    daily_changes = daily_changes or []
+    follow_ups = follow_ups or []
+    repository_resolutions = repository_resolutions or []
+    visible_repository_resolutions = [
+        item for item in repository_resolutions if item.get("status") != "ignored"
+    ]
     actions = artifact_actions(artifacts)
     lines = [
         "## Codex 每日任务摘要",
         "",
         f"**日期**：{local_today()}  ",
         f"**账本已记录未完成**：{len(tasks)}  ",
-        f"**Git / PR 待收尾**：{repository_closure.get('finding_count', 0)}  ",
+        f"**昨日实际任务**：{len(previous_activity)}  ",
+        f"**昨日已核实系统变更**：{len(daily_changes)}  ",
+        f"**周期任务**：{recurring_tasks.get('task_count', len(recurring_tasks.get('tasks', [])))}  ",
+        f"**续作监控**：{len(follow_ups)}  ",
+        (
+            f"**本轮仓库处置**：{len(visible_repository_resolutions)}  "
+            if repository_resolutions
+            else f"**仓库优先候选**：{min(3, repository_closure.get('finding_count', 0))}  "
+        ),
         f"**产物待确认**：{len(actions)}",
+        "",
+        "## 昨日实际工作与后续",
+        "",
+    ]
+    if not previous_activity:
+        lines.append("- 尚未记录前一自然日的 Codex 任务活动；这表示活动采集缺失，不表示昨天没有工作。")
+    else:
+        if activity_source == "operation_ledger_fallback":
+            lines.append("- 活动记录使用操作日志补全；完成状态只按已核实结果标注。")
+        activity_labels = {
+            "completed": "已完成",
+            "delivered_pending_trial": "已交付待试用",
+            "research_pending_implementation": "调研完成待实施",
+            "in_progress": "进行中",
+            "waiting_user": "等待用户",
+            "blocked": "阻塞",
+        }
+        for activity in previous_activity:
+            status = activity_labels.get(activity.get("status"), activity.get("status") or "未知")
+            title = markdown_label(activity.get("title") or "未命名任务")
+            project = markdown_label(activity_project_name(activity))
+            summary = markdown_label(compact_digest_text(activity.get("summary") or "未记录工作结果"))
+            next_action = markdown_label(compact_digest_text(activity.get("next_action") or "无后续动作"))
+            suffix = "" if title == project else f"：{title}"
+            lines.append(f"- **{status} · {project}**{suffix}")
+            lines.append(f"  昨日：{summary}")
+            lines.append(f"  下一步：{next_action}")
+
+    lines.extend(["", "## 昨日成果与系统变更", ""])
+    if not daily_changes:
+        lines.append("- 操作日志未记录昨日 Skill、Hook、Automation 或 Plugin 的已核实变更。")
+    else:
+        for change in daily_changes:
+            label = markdown_label(change.get("label") or "系统变更")
+            component = markdown_label(change.get("component") or "未知组件")
+            summary = markdown_label(compact_digest_text(change.get("summary") or "未记录变更概要"))
+            lines.append(f"- **{label}**：{component}")
+            lines.append(f"  结果：{summary}")
+
+    lines.extend(["", "## 周期任务运行状态", ""])
+    recurring_items = recurring_tasks.get("tasks", [])
+    if not recurring_items:
+        lines.append("- 当前没有发现项目声明的周期任务。")
+    else:
+        recurring_labels = {"success": "正常", "overdue": "延迟", "failed": "失败", "unknown": "待确认"}
+        for item in recurring_items:
+            status = recurring_labels.get(item.get("status"), item.get("status") or "未知")
+            project = markdown_label(item.get("project") or "未知项目")
+            name = markdown_label(item.get("name") or "周期任务")
+            reason = markdown_label(item.get("reason") or "未记录判断")
+            next_expected = markdown_label(item.get("next_expected_at") or "未记录")
+            lines.append(f"- **{status}**：{project} / {name}")
+            lines.append(f"  判断：{reason}")
+            if item.get("details"):
+                details = "；".join(
+                    f"{markdown_label(label)}：{markdown_label(value)}"
+                    for label, value in item["details"].items()
+                )
+                lines.append(f"  运行信息：{details}")
+            if item.get("scheduler_loaded") is not None:
+                loaded = "已加载" if item.get("scheduler_loaded") else "未加载"
+                runs = item.get("scheduler_runs")
+                exit_code = item.get("last_exit_code")
+                lines.append(
+                    f"  调度器：{loaded}；计划触发次数：{runs if runs is not None else '未知'}；"
+                    f"最后退出码：{exit_code if exit_code is not None else '未记录'}"
+                )
+            lines.append(f"  下次计划：{next_expected}")
+    for warning in recurring_tasks.get("warnings", [])[:5]:
+        lines.append(f"- 扫描警告：{markdown_label(warning)}")
+
+    lines.extend(["", "## 等待条件与续作监控", ""])
+    if not follow_ups:
+        lines.append("- 当前没有登记等待外部条件的续作目标。")
+    else:
+        for item in follow_ups:
+            label = markdown_label(item.get("monitor_label") or "续作监控")
+            title = markdown_label(item.get("title") or "未命名目标")
+            goal = markdown_label(item.get("goal") or "未记录目标")
+            wait_condition = markdown_label(item.get("wait_condition") or "未记录等待条件")
+            resume_action = markdown_label(item.get("resume_action") or "未记录恢复动作")
+            parallel_action = markdown_label(item.get("parallel_action") or "暂无安全并行工作")
+            monitor = item.get("monitor") or {}
+            automation_id = markdown_label(monitor.get("automation_id") or "未登记")
+            automation_status = markdown_label(item.get("automation_status") or "未知")
+            monitor_schedule = markdown_label(monitor.get("schedule") or "未记录计划")
+            next_check_at = markdown_label(item.get("next_check_at") or "未记录")
+            lines.append(f"- **{label}**：{title}")
+            lines.append(f"  当前目标：{goal}")
+            lines.append(f"  等待条件：{wait_condition}")
+            lines.append(
+                f"  监控：{automation_id}（{automation_status}；{monitor_schedule}；下次检查 {next_check_at}）"
+            )
+            recurring = item.get("recurring_task")
+            if recurring:
+                recurring_name = markdown_label(recurring.get("name") or item.get("recurring_task_id"))
+                recurring_status = markdown_label(recurring.get("status") or "unknown")
+                recurring_reason = markdown_label(recurring.get("reason") or "未记录判断")
+                lines.append(f"  关联周期任务：{recurring_name}：{recurring_status}（{recurring_reason}）")
+            if item.get("monitor_reasons"):
+                reasons = "；".join(markdown_label(reason) for reason in item["monitor_reasons"])
+                lines.append(f"  监控异常：{reasons}")
+            lines.append(f"  条件满足后：{resume_action}")
+            lines.append(f"  并行工作：{parallel_action}")
+            lines.append(f"  用户操作：{markdown_label(item.get('user_action') or '未记录')}")
+
+    lines.extend([
         "",
         "## 任务账本中的未完成任务",
         "",
-    ]
+    ])
     if not tasks:
         lines.append("- 任务账本当前为 0；账本为 0 不代表所有 Codex 任务都已完成。仍需结合 Git / PR 收尾状态与相关任务上下文判断。")
     else:
@@ -1151,59 +1867,8 @@ def daily_card_markdown(tasks, artifacts, recent_work=None, repository_closure=N
             next_action = markdown_label(task.get("next_action") or "未记录下一步")
             lines.append(f"- **{status}**：{title}（{project_label(task)}）")
             lines.append(f"  下一步：{next_action}")
-    closure_counts = repository_closure.get("counts", {})
-    lines.extend(
-        [
-            "",
-            "## Git / PR 收尾状态",
-            "",
-            "- 进行中 / 证据不足：{in_progress}；待集成：{awaiting_integration}；PR 待处理：{pr_pending}；历史遗留：{legacy}；已合并待清理：{merged_cleanup}。".format(
-                in_progress=closure_counts.get("in_progress", 0),
-                awaiting_integration=closure_counts.get("awaiting_integration", 0),
-                pr_pending=closure_counts.get("pr_pending", 0),
-                legacy=closure_counts.get("legacy", 0),
-                merged_cleanup=closure_counts.get("merged_cleanup", 0),
-            ),
-        ]
-    )
-    closure_findings = repository_closure.get("findings", [])
-    if not closure_findings:
-        lines.append("- 当前扫描范围内未发现待收尾 Git / PR 项；这仍不是对所有历史对话完成状态的证明。")
-    else:
-        category_labels = {
-            "in_progress": "进行中 / 证据不足",
-            "awaiting_integration": "待集成",
-            "pr_pending": "PR 待处理",
-            "legacy": "历史遗留",
-            "merged_cleanup": "已合并待清理",
-        }
-        for finding in closure_findings[:12]:
-            category = category_labels.get(finding.get("category"), finding.get("category", "未知"))
-            repository = markdown_label(finding.get("repository", "未知仓库"))
-            branch = markdown_label(finding.get("branch") or "(detached)")
-            finding_id = markdown_label(finding.get("id", ""))
-            reason = markdown_label(finding.get("reason", "待确认"))
-            lines.append(f"- **{category}** `{finding_id}`：{repository} / `{branch}`")
-            lines.append(f"  判断：{reason}")
-        if len(closure_findings) > 12:
-            lines.append(f"- 另有 {len(closure_findings) - 12} 项，详见仓库收尾报告。")
-    for warning in repository_closure.get("warnings", [])[:5]:
-        lines.append(f"- 扫描警告：{markdown_label(warning)}")
+    lines.extend(repository_closure_lines(repository_closure, repository_resolutions))
 
-    lines.extend(["", "## 最近成果记录", ""])
-    if not recent_work:
-        lines.append("- 当前没有记录到最近成果。")
-    else:
-        for work in recent_work:
-            title = markdown_label(work.get("title", "未命名工作"))
-            status = markdown_label(work.get("status", "completed"))
-            summary = markdown_label(work.get("summary") or "未记录概要")
-            usage = markdown_label(work.get("usage") or "未记录使用方式")
-            updated_at = markdown_label(work.get("updated_at") or "未记录")
-            lines.append(f"- **{status}**：{title}")
-            lines.append(f"  做了什么：{summary}")
-            lines.append(f"  如何使用：{usage}")
-            lines.append(f"  更新时间：{updated_at}")
     lines.extend(["", "## 前日产物和待确认内容", ""])
     if not actions:
         lines.append("- 当前没有待确认产物。")
@@ -1340,8 +2005,8 @@ def rollup_completed_weeks(today=None):
     return written
 
 
-def daily_digest(source):
-    if daily_summary_already_shown(source):
+def daily_digest(source, *, force=False):
+    if not force and daily_summary_already_shown(source):
         response(
             "",
             suppress_output=True,
@@ -1350,13 +2015,30 @@ def daily_digest(source):
         )
         return
     tasks = active_tasks()
+    operation_events = previous_day_operation_events()
+    previous_activity, activity_source = previous_day_activity_bundle(operation_events)
+    daily_changes = previous_day_operation_changes(operation_events)
     recent_work = recent_completed_work()
+    recurring_report = run_recurring_task_audit()
+    follow_ups = enrich_follow_ups(active_follow_ups(), recurring_report)
     closure_report = repository_closure_report(source)
+    repository_resolutions = today_repository_resolutions()
     new_artifacts = artifact_summary_entries()
     artifacts = upsert_pending_artifacts(new_artifacts)
     actions = artifact_actions(artifacts)
     deleted_daily_digests = cleanup_daily_digest_files()
-    summary = daily_card_markdown(tasks, artifacts, recent_work, closure_report)
+    summary = daily_card_markdown(
+        tasks,
+        artifacts,
+        recent_work,
+        closure_report,
+        previous_activity,
+        recurring_report,
+        daily_changes,
+        activity_source,
+        follow_ups,
+        repository_resolutions,
+    )
     saved_digest_path = save_daily_digest(summary)
     monthly_rollup_paths = rollup_completed_months()
     weekly_rollup_paths = rollup_completed_weeks()
@@ -1364,12 +2046,28 @@ def daily_digest(source):
     response(
         summary,
         task_count=len(tasks),
+        previous_day_activity_count=len(previous_activity),
+        previous_day_activities=previous_activity,
+        previous_day_activity_source=activity_source,
+        previous_day_change_count=len(daily_changes),
+        previous_day_changes=daily_changes,
         recent_completed_work_count=len(recent_work),
+        recurring_task_count=recurring_report.get("task_count", len(recurring_report.get("tasks", []))),
+        recurring_task_counts=recurring_report.get("counts", {}),
+        recurring_tasks=recurring_report.get("tasks", []),
+        recurring_task_warnings=recurring_report.get("warnings", []),
+        follow_up_count=len(follow_ups),
+        follow_up_attention_count=sum(
+            1 for item in follow_ups if item.get("monitor_state") == "attention"
+        ),
+        follow_ups=follow_ups,
         repository_closure_count=closure_report.get("finding_count", 0),
         repository_closure_counts=closure_report.get("counts", {}),
         repository_closure_findings=closure_report.get("findings", []),
         repository_closure_report_path=str(repository_closure_report_path("md")),
         repository_closure_warnings=closure_report.get("warnings", []),
+        repository_resolution_count=len(repository_resolutions),
+        repository_resolutions=repository_resolutions,
         artifact_summary_count=len(artifacts),
         artifact_actions=actions,
         new_artifact_candidate_count=len(new_artifacts),
@@ -1405,7 +2103,7 @@ def run(hook_input):
         )
         return
     if name in {"sessionstart", "session_start", "dailydigest", "daily_digest"}:
-        daily_digest(name)
+        daily_digest(name, force=bool(hook_input.get("force")))
         return
     if name in {"precompact", "pre_compact"}:
         tasks = active_tasks()

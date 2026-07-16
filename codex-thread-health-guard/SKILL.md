@@ -5,7 +5,7 @@ description: 当 Codex 线程上下文过长、任务执行明显吃力、上下
 
 # Codex Thread Health Guard
 
-用于判断当前 Codex 线程是否已经不适合继续承载任务。只在高风险时迁移；中低风险继续当前线程，避免打断任务。
+用于判断当前 Codex 线程是否已经不适合继续承载任务。只在高风险时迁移；中低风险继续当前线程，避免打断任务。已安装时，`SessionStart` hook 会在恢复/打开高风险线程时注入提醒；真正创建新线程仍由 agent 调用 Codex App 工具完成。
 
 ## 快速判定
 
@@ -15,14 +15,32 @@ description: 当 Codex 线程上下文过长、任务执行明显吃力、上下
 python3 /Users/dysania/program/codex-workflow-skills/codex-thread-health-guard/scripts/thread-health-guard.py --format json --pack-output /tmp/codex-continuation-pack.md
 ```
 
-脚本默认检查最近更新的线程；如果当前线程候选明显不对，先列出最近线程让用户选择，或传 `--thread-id`。
+脚本默认检查最近更新的线程；这在后台摘要或其他线程刚更新后可能不准。hook 会优先使用输入里的 `session_id`；手动调用时，如果当前线程候选明显不对，先列出最近线程让用户选择，或传 `--thread-id`。
 
 高风险主要有两类：
 
+- 极端长上下文：`tokens_used >= 1,000,000` 或 context card 已有 4 张及以上，即使暂时没有污染信号，也默认应接续到干净新线程。
 - 上下文压力明显，同时污染或吃力明显：`tokens_used` 很高、已有多张 context card，且出现用户多次纠错/重置范围、多个项目目标混杂、测试/命令/验证反复失败，或最新指令与旧计划冲突。
 - 阶段切换明确：当前 milestone/阶段已完成并 commit，接下来进入 M2/M3、review、重构、UI 等新工作单元。
 
-不要只因为线程长就迁移；也不要只因为一次报错就迁移。阶段切换要有“完成/提交/交接/下一阶段”一类明确信号。
+普通长线程不要只因为一次报错就迁移；极端长线程优先切干净线程，避免继续继承压缩噪声。阶段切换要有“完成/提交/交接/下一阶段”一类明确信号。
+
+## 主动提醒 Hook
+
+安装副本包含：
+
+```text
+scripts/thread-health-guard-hook.py
+hooks.json
+```
+
+该 hook 用于 `SessionStart`：恢复或打开线程时，如果当前线程高风险且无迁移阻断项，会向上下文注入系统提醒，要求 agent 先创建干净新线程。hook 不直接调用 `create_thread`，避免在命令行 hook 中绕过 Codex App 权限和线程工具。
+
+批量检查最近线程：
+
+```bash
+python3 /Users/dysania/program/codex-workflow-skills/codex-thread-health-guard/scripts/thread-health-guard.py --scan-recent 20 --format markdown
+```
 
 ## 高风险动作
 

@@ -79,6 +79,64 @@ class RepositoryClosureAuditTests(unittest.TestCase):
         self.assertNotIn(secret_canary, encoded)
         self.assertNotIn("TOKEN=", encoded)
 
+    def test_dirty_finding_explains_stage_and_recent_disposition_without_evidence_boilerplate(self):
+        repo = self.root / "dirty-stage"
+        init_repo(repo)
+        (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+        inspected = self.module.inspect_worktree(repo, today=date.today())
+        report = self.module.classify_findings([inspected], recent_days=15, today=date.today())
+        finding = report["findings"][0]
+
+        self.assertEqual("uncommitted_changes", finding["workflow_stage"])
+        self.assertEqual("active_deferred", finding["disposition"])
+        self.assertIn("1 个已跟踪改动", finding["reason"])
+        self.assertIn("当前分支 main", finding["reason"])
+        self.assertNotIn("证据不足", finding["reason"])
+
+    def test_dirty_finding_older_than_15_days_is_prioritized_for_auto_finish(self):
+        repo = self.root / "stale-dirty"
+        init_repo(repo)
+        (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        inspected = self.module.inspect_worktree(repo, today=date.today())
+        inspected["head_committed_at"] = "2026-06-01T10:00:00+08:00"
+        inspected["working_tree_updated_at"] = "2026-06-01T11:00:00+08:00"
+
+        report = self.module.classify_findings(
+            [inspected],
+            recent_days=15,
+            today=date(2026, 7, 16),
+        )
+        finding = report["findings"][0]
+
+        self.assertEqual(45, finding["age_days"])
+        self.assertTrue(finding["stale"])
+        self.assertEqual("auto_finish", finding["disposition"])
+        self.assertIn("超过 15 天", finding["next_action"])
+
+    def test_ignore_rules_skip_foreign_repository_by_path(self):
+        repo = self.root / "backend-cms-api"
+        init_repo(repo)
+        ignore_path = self.root / "ignore.json"
+        ignore_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "repositories": [
+                        {"path": str(repo), "reason": "非本人项目，不参与自动收尾"}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        rules = self.module.load_ignore_rules(ignore_path)
+        ignored = self.module.ignored_worktree(repo, rules)
+
+        self.assertTrue(ignored)
+        self.assertEqual("非本人项目，不参与自动收尾", ignored["reason"])
+
     def test_clean_unmerged_branch_without_pr_is_awaiting_integration(self):
         repo = self.root / "ahead"
         init_repo(repo)
@@ -102,7 +160,31 @@ class RepositoryClosureAuditTests(unittest.TestCase):
             )["findings"][0]["id"],
         )
 
-    def test_clean_detached_worktree_is_evidence_insufficient(self):
+    def test_inspection_separates_default_and_upstream_comparisons(self):
+        origin = self.root / "origin.git"
+        git(self.root, "init", "--bare", str(origin))
+        repo = self.root / "comparison"
+        init_repo(repo)
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "push", "-u", "origin", "main")
+        git(repo, "remote", "set-head", "origin", "main")
+        git(repo, "switch", "-c", "feature/compare")
+        (repo / "tracked.txt").write_text("feature one\n", encoding="utf-8")
+        git(repo, "commit", "-am", "feature one")
+        git(repo, "push", "-u", "origin", "feature/compare")
+        (repo / "tracked.txt").write_text("feature two\n", encoding="utf-8")
+        git(repo, "commit", "-am", "feature two")
+
+        inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
+
+        self.assertEqual(2, inspected["default_ahead_count"])
+        self.assertEqual(0, inspected["default_behind_count"])
+        self.assertEqual(1, inspected["upstream_ahead_count"])
+        self.assertEqual(0, inspected["upstream_behind_count"])
+        self.assertEqual("origin/main", inspected["default_comparison_ref"])
+        self.assertEqual("origin/feature/compare", inspected["upstream_comparison_ref"])
+
+    def test_clean_detached_worktree_already_in_default_is_cleanup(self):
         repo = self.root / "detached"
         init_repo(repo)
         git(repo, "switch", "--detach")
@@ -110,9 +192,9 @@ class RepositoryClosureAuditTests(unittest.TestCase):
         inspected = self.module.inspect_worktree(repo, today=date(2026, 7, 14))
         report = self.module.classify_findings([inspected], today=date(2026, 7, 14))
 
-        self.assertEqual(1, report["counts"]["in_progress"])
+        self.assertEqual(1, report["counts"]["merged_cleanup"])
         self.assertTrue(report["findings"][0]["detached"])
-        self.assertIn("detached", report["findings"][0]["reason"])
+        self.assertIn("可清理", report["findings"][0]["reason"])
 
     def test_unknown_default_branch_produces_warning(self):
         repo = self.root / "unknown-default"
@@ -224,7 +306,8 @@ class RepositoryClosureAuditTests(unittest.TestCase):
         rendered = self.module.render_markdown(report)
 
         self.assertIn("仓库收尾审计", rendered)
-        self.assertIn("进行中 / 证据不足：1", rendered)
+        self.assertIn("有未提交改动：1", rendered)
+        self.assertNotIn("证据不足", rendered)
         self.assertIn("2026-07-14", rendered)
 
 
