@@ -30,6 +30,12 @@ description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作
 ~/.codex/work-ledger/index.md
 ```
 
+跨任务操作日志位置：
+
+```text
+~/.codex/operation-ledger/events.jsonl
+```
+
 仓库收尾审计位置：
 
 ```text
@@ -110,6 +116,7 @@ python3 scripts/repository-action-budget.py show
 - `SessionStart`：每天最多打印一次当前未完成任务摘要，作为定时自动化的兜底；若当天已有仓库收尾报告则直接复用，避免重复网络读取。
 - `DailyDigest`：生成当日任务摘要并打印，供 Codex 定时自动化调用；先执行只读仓库收尾审计，再把 Program manifest、当前 `needs-review` 和 `trash-candidates` 中真正未归属的内容导入待确认产物池。输出使用 Markdown 卡片，产物包含稳定编号、内容概要、路径、选择原因和可回复操作短语。
 - 每日自动化在调用 `DailyDigest` 前，必须使用 `list_threads` / `read_thread` 读取前一自然日实际活跃任务，并通过 `record-activity` 写入精简活动记录；Hook 不保存完整 transcript。
+- 如果线程索引超时或读取失败，Hook 使用操作日志中的昨日项目/任务活跃事件作为降级证据，并从关联上下文卡片提取最近的助手进展；它仍明确标为“仅确认活跃、未推断完成”，不能退化成空白日报或把进展伪装成完成结论。
 - `PreCompact`：打印当前未完成任务摘要，供压缩上下文保留。
 
 Hook 失败时必须继续主流程；不要因为任务记录失败中断用户当前工作。
@@ -130,23 +137,25 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
 - “账本已记录未完成”为 0，只表示 task ledger 当前没有活动记录，不能证明所有 Codex 对话和仓库工作都已完成；必须同时查看 Git / PR 收尾状态和相关任务上下文。
 - “昨日实际工作与后续”是日报第一主区块，来源是前一自然日实际活跃的 Codex 任务，而不是最近若干条 work ledger。状态区分 `completed`、`delivered_pending_trial`、`research_pending_implementation`、`in_progress`、`waiting_user` 和 `blocked`。
+- 活动账本缺失时，操作日志中的 `context_compacted` 事件按线程去重后成为降级活动，并从其上下文卡片“最近助手进展”提取至多两条短证据；Skill、Hook、Automation 和 Plugin 的已核实新增/更新/移除事件进入“昨日成果与系统变更”。
 - 已开发、测试或部署但尚未真实使用的成果必须标为“已交付待试用”，并给出最小试运行步骤；调研结论尚未应用时标为“调研完成待实施”。
-- “最近成果记录”只是历史索引，不能替代昨日活动，也不能因记录较新就推断为昨天完成。
+- 历史 work ledger 只保留索引链接，不在每日日报重复滚动展示旧条目；昨日成果必须来自昨日活动或操作日志证据。
 - “周期任务运行状态”读取项目 `.codex/continuity.json`。只有计划时间、调度器状态、退出码以及结构化状态或成功日志的新鲜度一致时才报告正常；证据过期必须报告延迟，明确失败证据报告失败。
 - “Git / PR 收尾状态”按进行中 / 证据不足、待集成、PR 待处理、历史遗留、已合并待清理分类；扫描失败以警告展示，不阻塞日报。
 - “前日产物和待确认内容”展示的是待确认池中所有仍为 `pending` 的未归属候选，不只看昨天新增内容。
 - 待确认池不是“修改过的文件清单”，也不是审计日志。已纳入工作流的 Skill、Hook、AGENTS、Codex 配置、Git tracked 源码、Obsidian 正式笔记和已记录到工作成果账本的内容，都不应进入待确认池。
 - `/Users/dysania/program/codex-workflow-skills` 和 `/Users/dysania/program/skills` 是明确的正式源码根；目录自身即使是 Git 仓库根、近期没有提交或跨过周末，也不进入待确认池。
 - 如果候选路径是某个本地 Git 仓库里的源码子目录，并且它存在于当前分支、其他本地分支或 Git 历史中，即使当前分支只残留 `__pycache__`、`.DS_Store` 等缓存，也应视为“分支/项目状态提醒”，不要进入待确认产物池。
+- 即使项目尚未初始化 Git，只要候选是带 README、构建标记或明确源码结构的项目内部文件，也视为正式项目内容；不能一边识别为项目源码，一边继续提供删除/暂放/转待办操作。
 - 新候选会进入 `pending-artifacts.json` 和 `pending-artifacts.md`；只要用户没有确认删除、暂放、归档或转待办，就会在后续摘要中继续出现。
 - 顶级容器目录不应进入待确认池，例如 `/Users/dysania/program`、`/Users/dysania/program/tools`、`/Users/dysania/program/documents`、`/Users/dysania/program/env`、`/Users/dysania/program/AI`；这类路径只是组织空间，不是可删除或待归档产物。
 - 系统临时根目录 `/tmp`、`/private/tmp` 和当前 Python 临时根本身也是容器，不进入待确认池；其中满足临时图片规则的文件可直接清理。
-- 明显临时过程截图会自动清理或移出待确认池：Python 临时目录、`/tmp`、`/private/tmp` 下的 PNG/JPEG/GIF/WebP 图片不依赖文件名直接删除；未被 Obsidian 笔记引用且名称显示为预览/截图的生成附件也会清理。
+- 明显临时过程截图会自动清理或移出待确认池：Python 临时目录、`/tmp`、`/private/tmp` 和微信 `RWTemp` 下的 PNG/JPEG/GIF/WebP 图片不依赖文件名直接删除；未被 Obsidian 笔记引用且名称显示为预览/截图的生成附件也会清理。
 - 只有缺少上述归属证据的项目样目录才进入 aging，默认经过 3 个工作日仍无归属才提醒；周六、周日不累计。适用对象例如拉下来试玩的开源项目、demo、带 `.git`、`README.md`、`package.json`、`pyproject.toml` 等标记的未知目录。可用 `CODEX_PENDING_PROJECT_AGING_DAYS` 调整工作日数。
 - 每个待确认项都必须展示“内容”和“选择原因”：内容说明它是什么，选择原因说明它为什么被放入待确认池，例如来自会话产物记录、位于 `needs-review`、位于 `trash-candidates`、或项目样目录超过 aging 期。
 - 产物操作短语用于用户后续回复，例如 `删除 A02`、`暂放 A02`、`移到待办 A02`；不会因为摘要生成而自动删除或移动文件。
 - 已经由 `program-curator apply` 移动到 `needs-review` 或 `trash-candidates` 的内容，会通过对应目录进入摘要。
-- “最近成果记录”读取 `~/.codex/work-ledger/index.json`，展示状态与更新时间；它是历史成果索引，不等于“今天完成”，完整历史看 `index.md` 或 Obsidian 镜像。
+- “历史成果索引”只链接 `~/.codex/work-ledger/index.md`，不再逐条展示 `index.json` 中的旧成果；昨日成果必须由昨日活动或操作日志证据提供。
 
 ## 仓库收尾审计
 
@@ -300,5 +309,7 @@ CODEX_REPOSITORY_CLOSURE_TIMEOUT_SECONDS
 
 - 不要把完整 transcript、大段日志、完整 diff 写进任务账本。
 - 不要把没有明确下一步的普通聊天写成任务。
+- 不要在已经判断“属于正式项目源码/文档”后仍把同一条目留在待确认区。
+- 不要在昨日有操作日志证据时继续重复展示几天前的固定成果列表。
 - 不要永久删除 `cleanup_candidate`，除非用户有明确授权。
 - 不要把 token、Cookie、私钥、`.env` 值写入 ledger；脚本会做常见脱敏，但调用前仍应避免传入敏感文本。

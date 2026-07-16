@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import datetime as dt
+from unittest import mock
 from pathlib import Path
 
 
@@ -31,6 +32,7 @@ def write_jsonl(path, records):
 def run_hook(hook_input, ledger_dir, extra_env=None):
     env = os.environ.copy()
     env["CODEX_TASK_LEDGER_DIR"] = str(ledger_dir)
+    env["CODEX_OPERATION_LEDGER_PATH"] = str(Path(ledger_dir) / "operation-ledger" / "events.jsonl")
     env["CODEX_REPOSITORY_SCAN_ROOTS"] = str(Path(ledger_dir) / "repositories")
     env["CODEX_REPOSITORY_CLOSURE_INCLUDE_GITHUB"] = "0"
     if extra_env:
@@ -573,6 +575,67 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertEqual(output["new_artifact_candidate_count"], 0)
             self.assertFalse(transient_image.exists())
 
+    def test_daily_digest_filters_files_inside_nongit_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            program_root = tmp_path / "program"
+            governance_dir = tmp_path / "program-governance"
+            manifest_dir = governance_dir / "artifacts" / dt.date.today().isoformat()
+            manifest_dir.mkdir(parents=True)
+
+            project = program_root / "GEO"
+            source_file = project / "backend" / "app" / "services" / "geo_core_pipeline.py"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("def run():\n    return 'ok'\n", encoding="utf-8")
+            (project / "README.md").write_text("# GEO\n", encoding="utf-8")
+            (project / "backend" / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+            frontend = project / "frontend"
+            frontend.mkdir()
+            (frontend / "package.json").write_text("{}\n", encoding="utf-8")
+            manifest_dir.joinpath("geo-session.json").write_text(
+                json.dumps({"candidates": [{"path": str(source_file)}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_PROGRAM_ROOT": str(program_root),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(governance_dir),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(0, output["artifact_summary_count"])
+            self.assertEqual(0, output["new_artifact_candidate_count"])
+            self.assertNotIn("geo_core_pipeline.py", output["systemMessage"])
+
+    def test_daily_digest_auto_deletes_wechat_rwtemp_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            transient_image = (
+                tmp_path
+                / "Library"
+                / "Containers"
+                / "com.tencent.xinWeChat"
+                / "Data"
+                / "Documents"
+                / "xwechat_files"
+                / "temp"
+                / "RWTemp"
+                / "preview.png"
+            )
+            transient_image.parent.mkdir(parents=True)
+            transient_image.write_bytes(b"png")
+
+            hook = load_hook_module()
+            with mock.patch.object(hook.tempfile, "gettempdir", return_value="/not-a-temp-root"):
+                self.assertTrue(hook.auto_delete_transient_path(transient_image))
+            self.assertFalse(transient_image.exists())
+
     def test_daily_digest_filters_system_temp_root_container(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -815,7 +878,7 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertIn("A01", second_output["systemMessage"])
             self.assertIn("older-summary.md", second_output["systemMessage"])
 
-    def test_daily_digest_includes_recent_completed_work(self):
+    def test_daily_digest_references_completed_work_without_repeating_old_items(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             ledger_dir = tmp_path / "ledger"
@@ -847,10 +910,10 @@ class TaskContinuityHookTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             output = json.loads(result.stdout)
-            self.assertIn("## 最近成果记录", output["systemMessage"])
-            self.assertIn("实现每日摘要待确认池", output["systemMessage"])
-            self.assertIn("每日摘要展示所有未确认产物", output["systemMessage"])
-            self.assertIn("更新时间：2026-07-06T01:00:00Z", output["systemMessage"])
+            self.assertIn("## 历史成果索引", output["systemMessage"])
+            self.assertIn(str(work_dir / "index.md"), output["systemMessage"])
+            self.assertNotIn("实现每日摘要待确认池", output["systemMessage"])
+            self.assertNotIn("每日摘要展示所有未确认产物", output["systemMessage"])
             self.assertEqual(output["recent_completed_work_count"], 1)
 
     def test_daily_digest_prioritizes_yesterday_activity_and_follow_up(self):
@@ -899,6 +962,95 @@ class TaskContinuityHookTest(unittest.TestCase):
             self.assertIn("已交付待试用", output["systemMessage"])
             self.assertIn("调研 GEO 核心模块", output["systemMessage"])
             self.assertIn("连接一个真实平台并试运行", output["systemMessage"])
+
+    def test_daily_digest_falls_back_to_operation_ledger_and_hides_stale_work_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ledger_dir = tmp_path / "ledger"
+            work_dir = tmp_path / "work-ledger"
+            operation_ledger = tmp_path / "operation-ledger" / "events.jsonl"
+            operation_ledger.parent.mkdir(parents=True)
+            yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+            context_card = tmp_path / "context.md"
+            context_card.write_text(
+                "# Codex 上下文摘要卡片\n\n"
+                "## 最近助手进展\n\n"
+                "- `2026-07-15T03:00:00Z` **助手**: GEO 研究核心已完成真实来源核验。\n"
+                "- `2026-07-15T04:00:00Z` **助手**: GEO API 与浏览器验收通过，下一步连接真实平台试运行。\n\n"
+                "## 压缩前时间线\n",
+                encoding="utf-8",
+            )
+            write_jsonl(
+                operation_ledger,
+                [
+                    {
+                        "id": "evt-context",
+                        "action": "context_compacted",
+                        "occurred_at": f"{yesterday}T04:00:00Z",
+                        "status": "success",
+                        "importance": "routine",
+                        "project": {"name": "GEO", "path": str(tmp_path / "program" / "GEO")},
+                        "thread": {"id": "thread-geo", "title": "更新 GEO 核心模块"},
+                        "evidence": [{"kind": "context_card", "path": str(context_card)}],
+                    },
+                    {
+                        "id": "evt-skill",
+                        "action": "skill_updated",
+                        "occurred_at": f"{yesterday}T05:00:00Z",
+                        "status": "success",
+                        "importance": "important",
+                        "actor": {"id": "workflow-file-monitor", "label": "codex-context-summary-hook"},
+                        "summary": "上下文压缩 Skill：新增结构化压缩证据。",
+                        "changes": [{"label": "新增能力", "summary": "结构化压缩证据"}],
+                    },
+                    {
+                        "id": "evt-hook",
+                        "action": "hook_updated",
+                        "occurred_at": f"{yesterday}T05:05:00Z",
+                        "status": "success",
+                        "importance": "important",
+                        "actor": {"id": "workflow-file-monitor", "label": "context-summary-card"},
+                        "summary": "上下文压缩 Hook：补充项目活动回流。",
+                    },
+                ],
+            )
+            write_work_index(
+                work_dir,
+                [
+                    {
+                        "id": "stale-work",
+                        "title": "几天前的旧成果",
+                        "status": "completed",
+                        "summary": "不应每天重复展示",
+                        "updated_at": "2026-07-08T00:00:00Z",
+                    }
+                ],
+            )
+
+            result = run_hook(
+                {"hook_event_name": "DailyDigest"},
+                ledger_dir,
+                {
+                    "CODEX_OPERATION_LEDGER_PATH": str(operation_ledger),
+                    "CODEX_WORK_LEDGER_DIR": str(work_dir),
+                    "CODEX_PROGRAM_ROOT": str(tmp_path / "program"),
+                    "CODEX_PROGRAM_GOVERNANCE_DIR": str(tmp_path / "program-governance"),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual("operation_ledger_fallback", output["previous_day_activity_source"])
+            self.assertEqual(1, output["previous_day_activity_count"])
+            self.assertEqual(2, output["previous_day_change_count"])
+            self.assertIn("操作日志降级证据", output["systemMessage"])
+            self.assertIn("更新 GEO 核心模块", output["systemMessage"])
+            self.assertIn("GEO API 与浏览器验收通过", output["systemMessage"])
+            self.assertIn("## 昨日成果与系统变更", output["systemMessage"])
+            self.assertIn("codex-context-summary-hook", output["systemMessage"])
+            self.assertIn("context-summary-card", output["systemMessage"])
+            self.assertNotIn("## 最近成果记录", output["systemMessage"])
+            self.assertNotIn("几天前的旧成果", output["systemMessage"])
 
     def test_daily_digest_includes_recurring_task_status(self):
         with tempfile.TemporaryDirectory() as tmp:
