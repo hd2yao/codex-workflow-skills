@@ -30,6 +30,7 @@ class PatternRule:
     keywords: tuple[str, ...]
     suggested_shape: str
     reason: str
+    anchors: tuple[str, ...] = ()
 
 
 @dataclass
@@ -44,17 +45,18 @@ class Candidate:
     rule: PatternRule
     hits: int = 0
     files: set[Path] = field(default_factory=set)
+    sources: set[str] = field(default_factory=set)
     evidence: list[Evidence] = field(default_factory=list)
 
     @property
     def score(self) -> int:
-        return min(100, min(self.hits, 30) * 2 + len(self.files) * 4)
+        return min(100, min(self.hits, 30) * 2 + len(self.sources) * 6)
 
     @property
     def priority(self) -> str:
-        if self.score >= 60 and len(self.files) >= 5:
+        if self.score >= 60 and len(self.sources) >= 5:
             return "P0"
-        if self.score >= 28 and len(self.files) >= 2:
+        if self.score >= 28 and len(self.sources) >= 2:
             return "P1"
         return "P2"
 
@@ -78,6 +80,7 @@ PATTERNS = (
         ),
         suggested_shape="Skill 治理评审 / 模板合并 / 归档候选",
         reason="反复出现 skill 创建、安装、合并、归档时，适合沉淀为治理流程或模板资产。",
+        anchors=("skill", "技能", "template", "模板", "agents/openai.yaml", "SKILL.md", "skill-governance-review"),
     ),
     PatternRule(
         key="thread-continuity",
@@ -95,6 +98,7 @@ PATTERNS = (
         ),
         suggested_shape="插件入口 / 线程工作流 / 自动化提示",
         reason="反复处理上下文迁移时，应优先复用线程插件，避免重新扫描项目或重复总结。",
+        anchors=("线程", "thread", "codex-thread-bridge", "context card", "上下文摘要", "新开对话", "fork 当前线程"),
     ),
     PatternRule(
         key="research-roadmap",
@@ -160,6 +164,7 @@ PATTERNS = (
         ),
         suggested_shape="工作区治理 / 每日摘要 / 待确认池",
         reason="散落产物需要进入待确认池，但不应自动移动或删除受保护内容。",
+        anchors=("needs-review", "trash-candidates", "待确认", "program-workspace-governance", "pending-artifacts"),
     ),
     PatternRule(
         key="obsidian-codex-memory",
@@ -174,8 +179,23 @@ PATTERNS = (
         ),
         suggested_shape="Obsidian 索引 / 变更日志 / 资源页",
         reason="Codex 自身能力变化需要进长期索引，但不应写入完整 transcript 或敏感信息。",
+        anchors=("obsidian", "Codex 变更日志", "Codex Skills 搜索索引", "长期记忆"),
     ),
 )
+
+
+KNOWN_SKILLS = {
+    "skill-governance": ("skill-governance-review",),
+    "thread-continuity": ("codex-thread-bridge", "codex-task-continuity"),
+    "research-roadmap": (
+        "requirement-first-research",
+        "reference-project-study-roadmap",
+    ),
+    "project-audit": ("project-status-auditor",),
+    "github-bootstrap": ("github-project-bootstrap",),
+    "workspace-governance": ("program-workspace-governance",),
+    "obsidian-codex-memory": ("obsidian-memory-workflow",),
+}
 
 
 def redact(text: str) -> str:
@@ -211,9 +231,28 @@ def is_recent(path: Path, cutoff: dt.date) -> bool:
     return date is None or date >= cutoff
 
 
-def collect_files(args: argparse.Namespace, cutoff: dt.date) -> list[Path]:
-    roots: list[Path] = []
+def is_in_period(path: Path, start: dt.date, end: dt.date) -> bool:
+    date = parse_date(str(path))
+    return date is not None and start <= date <= end
+
+
+def collect_files(
+    args: argparse.Namespace,
+    cutoff: dt.date,
+    period: tuple[dt.date, dt.date] | None = None,
+) -> list[Path]:
     task_ledger = Path(args.task_ledger_dir).expanduser()
+    if period is not None:
+        activity_root = task_ledger / "activity"
+        activity_files = []
+        if activity_root.exists():
+            for item in sorted(activity_root.glob("*.json")):
+                if item.is_file() and is_in_period(item, *period):
+                    activity_files.append(item)
+        if activity_files:
+            return activity_files[-args.max_files :]
+
+    roots: list[Path] = []
     roots.extend(
         [
             task_ledger / "digests" / "daily",
@@ -241,10 +280,13 @@ def collect_files(args: argparse.Namespace, cutoff: dt.date) -> list[Path]:
         if not root.exists():
             continue
         for item in sorted(root.glob("*.md")):
-            if item.is_file() and is_recent(item, cutoff):
+            selected = (
+                is_in_period(item, *period) if period is not None else is_recent(item, cutoff)
+            )
+            if item.is_file() and selected:
                 files.append(item)
     for item in direct_files:
-        if item.exists() and item.is_file():
+        if period is None and item.exists() and item.is_file():
             files.append(item)
 
     seen: set[Path] = set()
@@ -266,25 +308,129 @@ def read_lines(path: Path, max_chars: int) -> list[str]:
     return text[:max_chars].splitlines()
 
 
+def source_id(path: Path) -> str:
+    match = re.search(r"(019[a-f0-9]+(?:-[a-f0-9]+){2,4})(?:\.md)?$", path.name)
+    if match:
+        return f"thread:{match.group(1)}"
+    return f"file:{path}"
+
+
+def source_lines(path: Path, max_chars_per_file: int):
+    if path.suffix == ".json" and path.parent.name == "activity":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        activities = data.get("activities", {})
+        items = activities.values() if isinstance(activities, dict) else activities
+        for index, item in enumerate(items or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            source = item.get("thread_id") or item.get("project_path") or f"{path}:{index}"
+            text = " ".join(
+                str(item.get(key) or "")
+                for key in ("project_name", "title", "status", "summary", "next_action")
+            )
+            yield f"thread:{source}", index, text[:max_chars_per_file]
+        return
+    source = source_id(path)
+    for line_no, line in enumerate(read_lines(path, max_chars_per_file), start=1):
+        yield source, line_no, line
+
+
 def analyze(files: Iterable[Path], max_chars_per_file: int) -> dict[str, Candidate]:
     candidates = {rule.key: Candidate(rule=rule) for rule in PATTERNS}
+    source_hits: dict[tuple[str, str], int] = {}
     for path in files:
-        file_hits: dict[str, int] = {rule.key: 0 for rule in PATTERNS}
-        for line_no, line in enumerate(read_lines(path, max_chars_per_file), start=1):
+        for source, line_no, line in source_lines(path, max_chars_per_file):
             lowered = line.casefold()
             for candidate in candidates.values():
+                if candidate.rule.anchors and not any(
+                    anchor.casefold() in lowered for anchor in candidate.rule.anchors
+                ):
+                    continue
                 matched = [kw for kw in candidate.rule.keywords if kw.casefold() in lowered]
                 if not matched:
                     continue
-                if file_hits[candidate.rule.key] >= 5:
+                hit_key = (candidate.rule.key, source)
+                existing_hits = source_hits.get(hit_key, 0)
+                if existing_hits >= 5:
                     continue
-                added_hits = min(len(matched), 5 - file_hits[candidate.rule.key])
-                file_hits[candidate.rule.key] += added_hits
+                added_hits = min(len(matched), 5 - existing_hits)
+                source_hits[hit_key] = existing_hits + added_hits
                 candidate.hits += added_hits
                 candidate.files.add(path)
+                candidate.sources.add(source)
                 if len(candidate.evidence) < 5:
                     candidate.evidence.append(Evidence(path, line_no, clean_line(line)))
     return candidates
+
+
+def find_existing_skills(args: argparse.Namespace) -> dict[str, list[str]]:
+    root = Path(args.existing_skills_dir).expanduser()
+    installed = {
+        item.name
+        for item in root.iterdir()
+        if root.exists() and item.is_dir() and (item / "SKILL.md").exists()
+    } if root.exists() else set()
+    return {
+        key: [slug for slug in slugs if slug in installed]
+        for key, slugs in KNOWN_SKILLS.items()
+    }
+
+
+def period_key(period: tuple[dt.date, dt.date]) -> str:
+    return f"{period[0].isoformat()}_to_{period[1].isoformat()}"
+
+
+def update_candidate_state(
+    candidates: dict[str, Candidate],
+    output_dir: Path,
+    period: tuple[dt.date, dt.date] | None,
+    existing_skills: dict[str, list[str]],
+) -> dict[str, object]:
+    path = output_dir / "candidates.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    entries = state.setdefault("candidates", {})
+    key = period_key(period) if period else None
+    if key:
+        for entry in entries.values():
+            periods = entry.get("periods", [])
+            if key in periods:
+                entry["periods"] = [item for item in periods if item != key]
+                entry["weeks_seen"] = len(entry["periods"])
+    for candidate in candidates.values():
+        if candidate.hits <= 0:
+            continue
+        entry = entries.setdefault(
+            candidate.rule.key,
+            {"periods": [], "weeks_seen": 0, "status": "observed"},
+        )
+        periods = entry.setdefault("periods", [])
+        if key and key not in periods:
+            periods.append(key)
+        entry.update(
+            {
+                "title": candidate.rule.title,
+                "latest_score": candidate.score,
+                "latest_file_count": len(candidate.files),
+                "latest_source_count": len(candidate.sources),
+                "weeks_seen": len(periods),
+                "existing_skills": existing_skills.get(candidate.rule.key, []),
+                "recommended_action": (
+                    "update_existing" if existing_skills.get(candidate.rule.key) else "monitor"
+                ),
+            }
+        )
+    state["updated_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+    return state
 
 
 def markdown_link(path: Path) -> str:
@@ -293,7 +439,13 @@ def markdown_link(path: Path) -> str:
     return f"`{escaped}`"
 
 
-def render_report(candidates: dict[str, Candidate], files: list[Path], args: argparse.Namespace) -> str:
+def render_report(
+    candidates: dict[str, Candidate],
+    files: list[Path],
+    args: argparse.Namespace,
+    period: tuple[dt.date, dt.date] | None,
+    existing_skills: dict[str, list[str]],
+) -> str:
     today = dt.date.fromisoformat(args.today)
     rows = sorted(
         [item for item in candidates.values() if item.hits > 0],
@@ -307,7 +459,11 @@ def render_report(candidates: dict[str, Candidate], files: list[Path], args: arg
         "# Codex 重复流程候选复盘",
         "",
         f"- 生成日期：{today.isoformat()}",
-        f"- 时间范围：最近 {args.days} 天",
+        (
+            f"- 时间范围：{period[0].isoformat()} 至 {period[1].isoformat()}"
+            if period
+            else f"- 时间范围：最近 {args.days} 天"
+        ),
         f"- 读取文件数：{len(files)}",
         "- 原则：只读摘要和账本；不读取完整 transcript；不自动创建、不自动删除、不自动改全局规则。",
         "",
@@ -318,14 +474,20 @@ def render_report(candidates: dict[str, Candidate], files: list[Path], args: arg
     if recommend:
         lines.extend(
             [
-                "| 优先级 | 候选 | 建议形态 | 分数 | 证据文件 | 理由 |",
+                "| 优先级 | 候选 | 处理方向 | 分数 | 独立来源 | 理由 |",
                 "|---|---|---|---:|---:|---|",
             ]
         )
         for item in recommend:
+            matched_skills = existing_skills.get(item.rule.key, [])
+            direction = (
+                f"更新已有能力：`{', '.join(matched_skills)}`"
+                if matched_skills
+                else f"继续监控：{item.rule.suggested_shape}"
+            )
             lines.append(
-                f"| {item.priority} | {item.rule.title} | {item.rule.suggested_shape} | "
-                f"{item.score} | {len(item.files)} | {item.rule.reason} |"
+                f"| {item.priority} | {item.rule.title} | {direction} | "
+                f"{item.score} | {len(item.sources)} | {item.rule.reason} |"
             )
     else:
         lines.append("- 本轮没有达到 P0/P1 阈值的重复流程候选。")
@@ -341,10 +503,22 @@ def render_report(candidates: dict[str, Candidate], files: list[Path], args: arg
 
     lines.extend(["## 暂不处理", ""])
     if defer:
-        lines.extend(["| 候选 | 分数 | 证据文件 | 暂不处理原因 |", "|---|---:|---:|---|"])
+        lines.extend(
+            [
+                "| 候选 | 处理方向 | 分数 | 独立来源 | 本周结论 |",
+                "|---|---|---:|---:|---|",
+            ]
+        )
         for item in defer[:8]:
+            matched_skills = existing_skills.get(item.rule.key, [])
+            direction = (
+                f"更新已有能力：`{', '.join(matched_skills)}`"
+                if matched_skills
+                else "继续监控，不创建新能力"
+            )
             lines.append(
-                f"| {item.rule.title} | {item.score} | {len(item.files)} | 证据不足或频率偏低，继续观察。 |"
+                f"| {item.rule.title} | {direction} | {item.score} | {len(item.sources)} | "
+                "尚未在多个独立任务中重复，不触发能力变更。 |"
             )
     else:
         lines.append("- 无。")
@@ -354,9 +528,9 @@ def render_report(candidates: dict[str, Candidate], files: list[Path], args: arg
             "",
             "## 下一步",
             "",
-            "1. 人工确认 P0/P1 候选是否值得处理。",
-            "2. 对确认项使用 `skill-governance-review` 判断应进入 Skill、模板、自动化、Hook、AGENTS 规则、Obsidian 索引，还是归档。",
-            "3. 只对已确认候选执行创建、合并或归档动作。",
+            "1. 保留本周候选与独立任务证据，下一周继续比较。",
+            "2. 只有跨独立任务重复且有回归场景的候选，才进入 `skill-governance-review`。",
+            "3. 治理评审通过后先试运行；验证有效才更新 Skill、模板、自动化、Hook 或规则。",
             "",
         ]
     )
@@ -375,6 +549,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--today", default=today)
+    parser.add_argument("--previous-week", action="store_true")
     parser.add_argument("--task-ledger-dir", default="~/.codex/task-ledger")
     parser.add_argument("--context-card-dir", default="~/.codex/context-cards")
     parser.add_argument("--work-ledger-dir", default="~/.codex/work-ledger")
@@ -383,6 +558,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="~/program/documents/obsidian_vault/03_Resources/Codex工作台",
     )
     parser.add_argument("--output-dir", default="~/.codex/workflow-pattern-reports")
+    parser.add_argument("--existing-skills-dir", default="~/.codex/skills")
     parser.add_argument("--max-files", type=int, default=120)
     parser.add_argument("--max-chars-per-file", type=int, default=120_000)
     parser.add_argument("--stdout", action="store_true")
@@ -396,10 +572,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     today = dt.date.fromisoformat(args.today)
     cutoff = today - dt.timedelta(days=args.days)
-    files = collect_files(args, cutoff)
+    period = None
+    if args.previous_week:
+        current_monday = today - dt.timedelta(days=today.weekday())
+        period = (current_monday - dt.timedelta(days=7), current_monday - dt.timedelta(days=1))
+    files = collect_files(args, cutoff, period)
     candidates = analyze(files, args.max_chars_per_file)
-    report = render_report(candidates, files, args)
-    path = write_report(report, Path(args.output_dir).expanduser(), args.today)
+    existing_skills = find_existing_skills(args)
+    output_dir = Path(args.output_dir).expanduser()
+    report = render_report(candidates, files, args, period, existing_skills)
+    path = write_report(report, output_dir, args.today)
+    update_candidate_state(candidates, output_dir, period, existing_skills)
 
     if args.json:
         payload = {
@@ -413,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
                     "score": item.score,
                     "hits": item.hits,
                     "file_count": len(item.files),
+                    "source_count": len(item.sources),
                 }
                 for item in sorted(candidates.values(), key=lambda c: -c.score)
                 if item.hits > 0

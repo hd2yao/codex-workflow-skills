@@ -1,11 +1,13 @@
 ---
 name: codex-error-learning-loop
-description: 适用于用户指出 Codex 理解错需求、没有先澄清、范围发散、上下文污染、跨项目误改、反复返工、验证声明不实、流程过重或搜索漏召回时使用；也适用于把已确认的对话错误整理为错误账本、判断是否应晋升到 Skill、项目 AGENTS、全局 AGENTS、Hook 或 Obsidian 长期记忆的场景。
+description: 适用于用户指出 Codex 理解错需求、范围发散、反复返工、验证声明不实或用户可见交付缺失时，轻量记录纠偏事实、按周聚合跨任务根因并受控跟踪 Skill、Hook 或规则改进候选；不在每轮对话自动审判或晋升。
 ---
 
 # Codex 错误学习闭环
 
-把用户纠错和已确认失败转成可复用的防复发规则。默认事件驱动，不自动审判每轮对话，不自动修改全局规则。
+把用户纠错和已确认失败转成可持续验证的改进候选。默认只做轻量观察：不在每轮对话或每次上下文压缩时审判，不因单个问题立即修改 Skill、Hook 或全局规则。
+
+这是一套围绕模型的 Harness Engineering：通过结构化记忆、周期评审、回归场景和治理门禁改进上下文与工具系统，不训练或修改模型权重。
 
 ## 触发判断
 
@@ -30,9 +32,9 @@ description: 适用于用户指出 Codex 理解错需求、没有先澄清、范
 
    当纠错改变了需求、范围、接口、数据、项目归属或验收标准时，回到相关 spec、plan 或执行契约更新；不要只做局部补丁。
 
-2. 写错误学习卡片
+2. 记录轻量观察
 
-   用精简卡片记录事实，不复制长 transcript，不记录 secrets。
+   明确纠正由静默 Hook 增量写入 `~/.codex/error-learning/observations.json`。Hook 只记录用户可验证的事实，不复制长 transcript，不记录 secrets，不打断当前任务，也不直接产出规则。
 
    | 字段 | 说明 |
    |---|---|
@@ -44,7 +46,7 @@ description: 适用于用户指出 Codex 理解错需求、没有先澄清、范
    | 应提前确认 | 如果重来，一开始该问或该检查什么 |
    | 防复发规则 | 下次遇到同类场景应执行的具体动作 |
    | 证据 | 文件、线程、命令、用户纠正或验证结果 |
-   | 处理状态 | 候选、已确认、已修正、已晋升、无需晋升 |
+   | 处理状态 | observed、clustered、monitoring、trial、adopted/rejected、verified |
 
 3. 分类错误类型
 
@@ -60,20 +62,35 @@ description: 适用于用户指出 Codex 理解错需求、没有先澄清、范
    | 流程过重或过轻 | 小任务套重流程，或高风险任务缺少契约和验证 |
    | 搜索漏召回 | 用户给的明显线索或同义关键词没有进入搜索策略 |
 
-4. 判断晋升位置
+4. 每周聚合与根因评审
+
+   每周只分析上一自然周（周一到周日），按独立任务而非消息数量计数。同一任务内反复纠正只算一个任务来源，防止长对话放大权重。
+
+   对跨任务重复问题使用第一性原理和对抗式审查：
+
+   - 用户真正需要的结果是什么？
+   - 哪个完成标准、事实源、等待条件或反馈闭环缺失？
+   - 这个解释能否同时解释多个独立任务，还是只是在复述表象？
+   - 新规则会不会修复一个案例却破坏正常任务，造成过拟合？
+
+5. 判断晋升位置
 
    | 情况 | 动作 |
    |---|---|
    | 一次性、低风险 | 只在当前回复中给卡片或简短教训，不改文件 |
    | 已确认但还不稳定 | 写入任务/项目复盘或 Obsidian 候选记录 |
-   | 同类错误重复 2 次以上 | 更新相关 Skill 的失败模式或检查点 |
+   | 同类错误出现在至少 2 个独立任务 | 进入 `monitoring`，补回归场景，不直接改规则 |
    | 只影响当前仓库 | 更新项目 `AGENTS.md` 或项目内 Skill |
    | 跨项目高频、默认入口或安全边界 | 先用 `skill-governance-review`，再考虑全局 `AGENTS.md` |
-   | 需要自动捕获 | 先做 Hook 方案和停止条件；Hook 只产候选，不自动晋升 |
+   | 需要自动捕获 | Hook 只产观察事实；失败静默，不自动晋升 |
 
    涉及 Skill 新增、更新、安装、归档、改名或删除时，必须先使用 `skill-governance-review`。涉及 Obsidian 写入时，先读取 Vault 根目录 `AGENTS.md`，并遵守其 PARA 写入规则。
 
-5. 选择后续工具
+6. 受控试运行与验证
+
+   候选只有同时满足以下条件才能进入 `trial`：至少 2 个独立任务、明确回归场景、`skill-governance-review` 已批准。试运行后必须继续监控；有效才进入 adopted/verified，无效或副作用过大则 rejected。
+
+7. 选择后续工具
 
    | 场景 | 后续入口 |
    |---|---|
@@ -101,6 +118,22 @@ description: 适用于用户指出 Codex 理解错需求、没有先澄清、范
 
 如果用户只需要继续任务，把卡片压缩成 3-5 行，不要打断主流程。
 
+## 账本命令
+
+```bash
+python3 scripts/error-learning-ledger.py record-observation \
+  --thread-id THREAD_ID --occurred-at ISO_TIME \
+  --summary "纠正事实" --expected "期望结果" \
+  --category user_visibility_gap --format json
+
+python3 scripts/error-learning-ledger.py synthesize-week \
+  --today YYYY-MM-DD --format json
+
+python3 scripts/error-learning-ledger.py list-candidates --format json
+```
+
+候选状态更新使用 `update-candidate`。进入 `trial` 时脚本会强制检查跨任务证据、回归场景和治理批准，不能由 prompt 绕过。
+
 ## 安全边界
 
 - 不记录 secrets、tokens、私钥、Cookie、账号密码、`.env` 值。
@@ -108,3 +141,5 @@ description: 适用于用户指出 Codex 理解错需求、没有先澄清、范
 - 不把一次错误直接升级成全局规则。
 - 不自动安装外部 Skill，不复制许可证不清的 Skill 正文。
 - 不让 Hook 自动修改 Obsidian、Skill 或 `AGENTS.md`；Hook 最多生成候选事实。
+- 不把同一任务内的多次表达伪装成多个独立复发。
+- 不因“本周出现一次”创建新 Skill；已有能力优先更新，不复制同类入口。

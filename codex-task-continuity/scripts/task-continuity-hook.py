@@ -1947,14 +1947,14 @@ def rollup_completed_months(today=None):
     for year_month in months:
         monthly_path = monthly_digest_archive_path(year_month)
         lines = [
-            f"# Codex 月摘要 {year_month}",
+            f"# Codex 月归档 {year_month}",
             "",
-            "本文件由每日摘要和周摘要自动汇总生成。生成后，来源 daily/weekly 文件会从活跃归档中移除。",
+            "本文件由每日摘要和周归档自动汇总生成，只作为内部证据。生成后，来源 daily/weekly 文件会从活跃归档中移除。",
             "",
         ]
         weekly_items = weekly_by_month.get(year_month, [])
         if weekly_items:
-            lines.extend(["## 周摘要", ""])
+            lines.extend(["## 周归档", ""])
             for (start, end), path in weekly_items:
                 lines.extend([f"### {start.isoformat()} 至 {end.isoformat()}", "", read_digest_text(path).strip(), ""])
         daily_items = daily_by_month.get(year_month, [])
@@ -1991,9 +1991,9 @@ def rollup_completed_weeks(today=None):
         end = items[-1][0]
         weekly_path = weekly_digest_archive_path(start, end)
         lines = [
-            f"# Codex 周摘要 {start.isoformat()} 至 {end.isoformat()}",
+            f"# Codex 周归档 {start.isoformat()} 至 {end.isoformat()}",
             "",
-            "本文件由每日摘要自动汇总生成。生成后，来源 daily 文件会从活跃归档中移除。",
+            "本文件由每日摘要自动拼接，只作为内部证据，不等同于用户可见的每周工作总结。生成后，来源 daily 文件会从活跃归档中移除。",
             "",
         ]
         for day, path in items:

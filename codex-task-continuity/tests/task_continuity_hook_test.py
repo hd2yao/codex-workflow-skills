@@ -1419,7 +1419,7 @@ print(json.dumps({
             self.assertEqual(len(output["weekly_rollup_paths"]), 1)
             weekly_path = Path(output["weekly_rollup_paths"][0])
             self.assertTrue(weekly_path.exists())
-            self.assertIn("Codex 周摘要", weekly_path.read_text(encoding="utf-8"))
+            self.assertIn("Codex 周归档", weekly_path.read_text(encoding="utf-8"))
             for day in week_dates:
                 self.assertFalse((daily_dir / f"{day.isoformat()}.md").exists())
             self.assertTrue(digest_daily_path(ledger_dir).exists())
@@ -1435,7 +1435,7 @@ print(json.dumps({
             daily_dir.mkdir(parents=True)
             weekly_path = weekly_dir / f"{first_prev_month.isoformat()}_to_{last_prev_month.isoformat()}.md"
             daily_path = daily_dir / f"{last_prev_month.isoformat()}.md"
-            weekly_path.write_text("# Codex 周摘要\n\nweekly content\n", encoding="utf-8")
+            weekly_path.write_text("# Codex 周归档\n\nweekly content\n", encoding="utf-8")
             daily_path.write_text("# Codex 每日任务摘要\n\ndaily content\n", encoding="utf-8")
 
             result = run_hook({"hook_event_name": "DailyDigest"}, ledger_dir)
@@ -1447,7 +1447,7 @@ print(json.dumps({
             self.assertEqual(monthly_path.name, f"{year_month}.md")
             self.assertTrue(monthly_path.exists())
             text = monthly_path.read_text(encoding="utf-8")
-            self.assertIn("Codex 月摘要", text)
+            self.assertIn("Codex 月归档", text)
             self.assertIn("weekly content", text)
             self.assertIn("daily content", text)
             self.assertFalse(weekly_path.exists())
