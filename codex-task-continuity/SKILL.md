@@ -1,6 +1,6 @@
 ---
 name: codex-task-continuity
-description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作、管理待做或等待确认事项、目标因外部条件暂停后的监控与续作、查看已完成成果、生成每日摘要、检查项目周期任务是否正常运行，或需要检查本地仓库中未提交改动、未合并分支、worktree 与 PR 收尾状态时使用。
+description: 当用户询问还有哪些任务、想恢复之前的 Codex 工作、管理待做或等待确认事项、目标因外部条件暂停后的监控与续作、查看已完成成果、生成每日摘要或语义周报、检查项目周期任务是否正常运行，或需要检查本地仓库中未提交改动、未合并分支、worktree 与 PR 收尾状态时使用。
 ---
 
 # Codex 任务连续性
@@ -108,6 +108,7 @@ python3 scripts/work-ledger.py sync-obsidian
 python3 scripts/repository-closure-audit.py --root /Users/dysania/program --include-github --format json
 python3 scripts/recurring-task-audit.py --root /Users/dysania/program --format json
 python3 scripts/repository-action-budget.py show
+python3 scripts/period-review.py --previous-week --stdout
 ```
 
 需要机器可读输出时加：
@@ -134,6 +135,7 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 
 - 不启用 `Stop`，避免每轮对话结束都写任务或制造噪声。
 - 用 Codex recurring automation 每天固定时间调用 `DailyDigest`，把摘要发到配置中的目标线程。
+- 用独立的每周自动化在周一日报完成后运行纠偏聚合、流程复盘和 `period-review.py`，把语义周报发到摘要归档任务。不要把周级成长复盘塞进日报。
 - `SessionStart` 只在当天还没有展示过摘要时兜底提示一次。
 
 每日摘要展示规则：
@@ -142,7 +144,9 @@ Hook 失败时必须继续主流程；不要因为任务记录失败中断用户
 - 默认北京时间每天 08:00 触发；自动化 `rrule` 使用 UTC `DTSTART:20260708T000000Z` 表示。
 - 发送到创建自动化时绑定的 Codex 摘要归档线程；hook 当前不能识别 Codex UI 正在聚焦的其他对话，也不能自动投递到多个窗口。即使用户当时没看到，重启后仍可在该线程历史里查看。
 - 摘要会展示在自动化绑定线程，并保存到 `~/.codex/task-ledger/digests/daily/YYYY-MM-DD.md`；旧版 `~/.codex/task-ledger/daily/YYYY-MM-DD.md` 只作为历史兼容清理目录。
-- 每次生成摘要时会自动滚动归档：已结束周的 daily 合成 `digests/weekly/YYYY-MM-DD_to_YYYY-MM-DD.md` 后删除来源 daily；已结束月的 weekly/daily 合成 `digests/monthly/YYYY-MM.md` 后删除来源 weekly/daily。
+- 每次生成摘要时会自动滚动归档：已结束周的 daily 拼接成内部“周归档” `digests/weekly/YYYY-MM-DD_to_YYYY-MM-DD.md` 后删除来源 daily；已结束月的 weekly/daily 拼接成内部“月归档”后删除来源文件。归档不是用户可见的语义周报。
+- 用户可见的每周工作总结保存到 `digests/reviews/weekly/YYYY-MM-DD_to_YYYY-MM-DD.md`，按项目合并一周进展并展示完成/待试用、继续推进、周期任务、Codex 工作流变更、跨任务根因、Harness 成长候选和仅在确需时的用户操作。
+- 周报只分析上一自然周（周一至周日）；原始日报、context card、报告路径和内部编号仅作证据，不进入用户卡片。
 - 摘要内容采用 Markdown 卡片；这不是原生 UI 组件。当前 hook API 不支持在消息中创建 Codex 原生文件卡片或按钮。
 - “账本已记录未完成”为 0，只表示 task ledger 当前没有活动记录，不能证明所有 Codex 对话和仓库工作都已完成；必须同时查看 Git / PR 收尾状态和相关任务上下文。
 - “昨日实际工作与后续”是日报第一主区块，来源是前一自然日实际活跃的 Codex 任务，而不是最近若干条 work ledger。状态区分 `completed`、`delivered_pending_trial`、`research_pending_implementation`、`in_progress`、`waiting_user` 和 `blocked`。
